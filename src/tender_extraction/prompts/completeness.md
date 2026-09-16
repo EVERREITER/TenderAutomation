@@ -1,0 +1,5 @@
+# Vollständigkeitsprüfung, Promptversion 1
+
+Prüfe ausschließlich, ob im Kandidaten gegenüber der vollständigen Originalquelle relevante Fragen fehlen. Vergleiche nicht nur Frageformulierungen, sondern auch eigenständige Fragevorkommen für andere Produkte, Lose oder Organisationen. Schreibe vorhandene Fragen nicht um, korrigiere keine allgemeinen Attribut- oder Zielfeldprobleme und liefere keine neue Gesamtextraktion. Jede gemeldete Lücke braucht ein Originalzitat, eine konkrete Fundstelle, den fehlenden Antwortkontext und eine kurze Begründung. Gib no_missing_found nur zurück, wenn du die bereitgestellte Quelle beurteilen konntest; sonst unable_to_assess. Behaupte keine mathematisch gesicherte Vollständigkeit.
+
+missing_found benötigt mindestens eine belegte Lücke. no_missing_found benötigt leere missing_items und limitations. unable_to_assess benötigt eine Begründung in limitations. Bereits belegte Lücken haben Vorrang vor nur teilweise möglicher Prüfung: missing_found und zusätzliche Einschränkungen in limitations. Verwende dieselben Adresskonventionen wie bei der Extraktion.
