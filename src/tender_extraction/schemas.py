@@ -1,13 +1,6 @@
-"""Define typed model-response, review, validation, and result contracts.
-
-Extraction and Completeness are the main structured-output entry points:
-model_json_schema() produces their API schemas and model_validate_json()
-validates responses. Completeness also checks review-status consistency.
-Result, FinalQuestion, FinalField, and Check represent locally enriched output.
-Wire models reject extra properties and use explicit nullable fields.
-"""
+"""Typed Excel extraction, validation, and result contracts."""
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict
 
 
 class Wire(BaseModel):
@@ -15,14 +8,9 @@ class Wire(BaseModel):
 
 
 class Address(Wire):
-    document: Literal["original", "rendered_pdf"]
+    document: Literal["original"]
     sheet: str | None
     cell_range: str | None
-    page: int | None
-    # Unrotated PDF media-box points, top-left origin; 1-based page.
-    bbox: list[float] | None
-    word_path: str | None
-    form_field: str | None
 
 
 class SourceReference(Wire):
@@ -35,6 +23,8 @@ class Question(Wire):
     id: str
     original: str
     normalized: str
+    notes: str | None
+    note_source_ids: list[str]
     language: str | None
     kind: str | None
     section: str | None
@@ -55,7 +45,7 @@ class AnswerField(Wire):
     label: str | None
     role: Literal["main_answer", "comment", "number", "evidence_reference", "unknown"]
     semantic_type: Literal["text", "number", "date", "yes_no", "single_choice", "multi_choice", "document", "unknown"]
-    control_type: Literal["excel_cell", "excel_dropdown", "pdf_text", "pdf_choice", "pdf_button", "word_control", "printed", "unknown"]
+    control_type: Literal["excel_cell", "excel_dropdown", "printed", "unknown"]
     target_status: Literal["located", "not_present", "unresolved"]
     address: Address | None
     order: int
@@ -100,40 +90,11 @@ class Extraction(Wire):
     limitations: list[str]
 
 
-class MissingItem(Wire):
-    quote: str
-    source_reference: Address
-    context: str
-    reason: str
-
-
-class Completeness(Wire):
-    review_status: Literal["no_missing_found", "missing_found", "unable_to_assess"]
-    missing_items: list[MissingItem]
-    limitations: list[str]
-
-    @model_validator(mode="after")
-    def consistent(self):
-        if self.missing_items:
-            if self.review_status != "missing_found" or any(not x.quote.strip() or not x.reason.strip() or not x.context.strip() for x in self.missing_items):
-                raise ValueError("Belegte Lücken erfordern missing_found und vollständige Belege")
-            for item in self.missing_items:
-                a = item.source_reference
-                if not ((a.sheet and a.cell_range) or (a.page is not None and a.page > 0) or a.word_path):
-                    raise ValueError("Lücke ohne konkrete Fundstelle")
-        elif self.review_status == "missing_found":
-            raise ValueError("missing_found ohne Lücke")
-        if self.review_status == "no_missing_found" and self.limitations:
-            raise ValueError("no_missing_found mit Beurteilungseinschränkungen")
-        if self.review_status == "unable_to_assess" and not self.limitations:
-            raise ValueError("unable_to_assess benötigt Begründung")
-        return self
-
-
 class Check(Wire):
     subject: str
     code: str
     result: Literal["passed", "failed", "not_verifiable", "not_applicable"]
+    severity: Literal["info", "warning", "error"] = "info"
     observed: str
     claim: str
     reason: str

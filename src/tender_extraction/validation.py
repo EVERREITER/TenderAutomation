@@ -1,46 +1,49 @@
-"""Check extraction claims against source evidence and enrich final results.
-
-validate() returns technical checks for references, source quotations, fields,
-options, document structure, and shared targets. enrich() adds deterministic
-keys and nests answer fields and options in the final Result. Supporting entry
-points include canonical_address(), covered(), and ocr_polygon_to_pdf() for
-address normalization, sparse Excel coverage, and supported OCR transformations.
-These checks do not prove semantic correctness or complete question discovery.
-"""
+"""Validate Excel evidence and enrich questions with stable keys and nested fields."""
 import hashlib
 import json
+import re
+from difflib import SequenceMatcher
 from collections import Counter
+from . import SCHEMA_VERSION
 from .schemas import Check, Result, FinalQuestion, FinalField
 from .services.openai_client import canonical
 from .readers.excel import bounds, contains
 
 
 def norm(text):
-    return " ".join(str(text).split())
+    # Decode Excel whitespace escapes once; escaped literal underscores stay literal.
+    text = re.sub(r"_x([0-9a-fA-F]{4})_", lambda m:
+        chr(int(m[1], 16)) if int(m[1], 16) in (9, 10, 13) else m[0], str(text))
+    return " ".join(text.split())
 
 
-def ocr_polygon_to_pdf(polygon, ocr_page, pdf_page):
-    """DI top-left inches -> unrotated MediaBox top-left points.
+def text_outcome(observed, claim, *, substring=False):
+    """Exact normalized evidence, a narrowly bounded typo, or a real mismatch.
 
-    No guessed scaling for pixels, unusual UserUnit, crop/dimension mismatch.
-    DI's text angle is not a page-coordinate rotation and is not reapplied.
+    Never fuzzy-accept numbers, missing words, negations, or short units.
+    Minor spelling differences remain warnings, not verified quotations.
     """
-    if ocr_page.get("unit") != "inch" or pdf_page.get("user_unit",1) != 1:
-        return None
-    w,h = pdf_page["width"],pdf_page["height"]
-    rotation = pdf_page.get("rotation",0) % 360
-    if rotation not in (0,90,180,270): return None
-    dw,dh = (h,w) if rotation in (90,270) else (w,h)
-    if abs(ocr_page.get("width",0)*72-dw)>2 or abs(ocr_page.get("height",0)*72-dh)>2: return None
-    if not polygon or len(polygon)%2: return None
-    points=[]
-    for i in range(0,len(polygon),2):
-        x,y = polygon[i]*72,polygon[i+1]*72
-        if rotation==90: x,y = y,h-x
-        elif rotation==180: x,y = w-x,h-y
-        elif rotation==270: x,y = w-y,x
-        points.append((x,y))
-    return [min(x for x,y in points),min(y for x,y in points),max(x for x,y in points),max(y for x,y in points)]
+    source, quoted = norm(observed), norm(claim)
+    if quoted and (quoted in source if substring else quoted == source):
+        return "passed"
+    left, right = source.split(), quoted.split()
+    if not quoted or len(left) != len(right):
+        return "failed"
+    differences = [(a,b) for a,b in zip(left,right) if a != b]
+    if not 1 <= len(differences) <= 2:
+        return "failed"
+    for a,b in differences:
+        if min(len(a),len(b)) < 8 or a[:4] != b[:4] or not a.rstrip('.,;:()').isalpha() or not b.rstrip('.,;:()').isalpha():
+            return "failed"
+        edits = sum(max(j-i,l-k) for op,i,j,k,l in SequenceMatcher(None,a,b,autojunk=False).get_opcodes() if op != 'equal')
+        if edits > 1:
+            return "failed"
+    return "not_verifiable"
+
+
+def validation_status(checks):
+    """Only definite, material errors block technical completion."""
+    return "needs_review" if any(c.severity == "error" for c in checks) else "completed"
 
 
 def key(*parts):
@@ -77,10 +80,14 @@ def canonical_address(address, manifest):
     return a
 
 
-def validate(candidate, manifest, di=None):
+def validate(candidate, manifest):
+    if manifest["kind"] != "excel":
+        raise ValueError("Excel manifest required")
     checks = []
     def add(subject, code, outcome, observed, claim, reason):
-        checks.append(Check(subject=subject,code=code,result=outcome,observed=str(observed),claim=str(claim),reason=reason))
+        advisory = code in {"merge_anchor", "protected_target", "confidence_range"}
+        severity = "error" if outcome == "failed" and not advisory else "warning" if outcome in ("failed", "not_verifiable") else "info"
+        checks.append(Check(subject=subject,code=code,result=outcome,severity=severity,observed=str(observed),claim=str(claim),reason=reason))
     groups = {"question":candidate.questions,"field":candidate.answer_fields,"option":candidate.options,"source":candidate.source_references,"position":candidate.positions}
     ids = {kind:{x.id for x in items} for kind,items in groups.items()}
     for kind, items in groups.items():
@@ -99,84 +106,47 @@ def validate(candidate, manifest, di=None):
         valid_owner = a.owner_id == "document" if a.owner_type == "document" else a.owner_id in ids[a.owner_type]
         if not valid_owner or any(x not in refs for x in a.source_ids): add(a.owner_id,"attribute_reference","failed",a.source_ids,a.name,"Attributzugehörigkeit oder Quellen ungültig")
         if a.value is not None and not a.source_ids: add(a.owner_id,"attribute_evidence","not_verifiable","Keine Quelle",a.name,"Attribut nicht belegt")
-    if manifest["kind"] != "excel":
-        actual = {p["number"] for p in manifest["pages"]}
-        ocr_pages = (di or {}).get("pages",[])
-        seen = [p.get("pageNumber",p.get("page_number")) for p in ocr_pages]
-        add("document","ocr_page_coverage","passed" if set(seen)==actual and len(seen)==len(actual) else "failed",seen,sorted(actual),"Alle PDF-Seiten müssen genau einmal von OCR erfasst sein")
-
     def source_check(subject, address, quote, target=False):
-        if manifest["kind"] == "excel":
-            s = next((s for s in manifest["sheets"] if s["name"] == address.sheet),None)
-            b = bounds(address.cell_range or "")
-            if address.document != "original" or address.page is not None or address.word_path is not None or not s or not b:
-                add(subject,"excel_address","failed", "Blatt/Adresse/Dateiversion ungültig",address,"Keine gültige Excel-Fundstelle")
-                return
-            cells = [(a,c) for a,c in s["cells"].items() if contains(address.cell_range,a)]
-            known_ranges = [r["range"] for r in s["blank_ranges"]]+[r["range"] for r in s["merges"]]+[v for r in s["validations"] for v in r.get("sqref","").split()]
-            observed = covered(address.cell_range,known_ranges+list(s["cells"])+list(s.get("comments",{})))
-            add(subject,"excel_address","passed" if observed else "not_verifiable",observed,address.cell_range,"Strukturmanifest, kein ws.cell()-Existenztest; keine semantische Zielbestätigung")
-            for merge in s["merges"]:
-                if contains(merge["range"],address.cell_range):
-                    add(subject,"merge_anchor","passed" if address.cell_range.replace("$","") in (merge["anchor"],merge["range"]) else "failed",merge,address.cell_range,"Verbundene Zellen verwenden den Anker")
-            if not target:
-                texts = []
-                for a,c in cells:
-                    texts.extend([c.get("value"),c.get("cached_value"), (c.get("formula") or {}).get("text"),s.get("comments",{}).get(a,{}).get("text")])
-                texts.append(s.get("comments",{}).get(address.cell_range,{}).get("text"))
-                text = "\n".join(str(t) for t in texts if t is not None)
-                ok = bool(norm(quote)) and norm(quote) in norm(text)
-                add(subject,"source_quote","passed" if ok else "failed",text,quote,"Exakter Teiltext nach reiner Leerraum-Normalisierung; keine unscharfe Bestätigung")
-            if target:
-                styles = [c["style"] for _,c in cells]+[r["style"] for r in s["blank_ranges"] if contains(r["range"],address.cell_range)]
-                if any(c.get("formula") for _,c in cells): add(subject,"formula_target","failed","Formelzelle",address.cell_range,"Formeln nicht überschreiben")
-                if s["protected"] and any(manifest["styles"][str(st)]["locked"] for st in styles): add(subject,"protected_target","failed","Aktiver Blattschutz + locked",address.cell_range,"Geschütztes Ziel")
+        s = next((s for s in manifest["sheets"] if s["name"] == address.sheet),None)
+        if s and address.document == "original" and address.cell_range is None and not target:
+            add(subject,"sheet_name_quote","passed" if quote == s["name"] else "failed",
+                s["name"],quote,"Blattname als exakter Kontextbeleg, kein Zellinhalt")
             return
-        # Native Word positions are only in the original document, never PDF points.
-        if address.word_path is not None:
-            item = next((x for x in manifest.get("word_index",[]) if x["path"] == address.word_path),None)
-            valid = address.document == "original" and item is not None and address.page is None and address.bbox is None
-            add(subject,"word_structure","passed" if valid else "failed",item,address,"Exakter OOXML-Pfad einschließlich Tabellen/Steuerelementen")
-            if valid and not target:
-                add(subject,"source_quote","passed" if norm(quote) and norm(quote) in norm(item["text"]) else "failed",item["text"],quote,"Leerraum-normalisierter Originaltext")
-            if valid:
-                duplicates = [x for x in manifest["word_index"] if x["kind"] == item["kind"] and norm(x["text"]) == norm(item["text"])]
-                if not item["text"].strip() or len(duplicates)>1:
-                    add(subject,"word_pdf_mapping","not_verifiable",len(duplicates),address.word_path,"Leere/doppelte Texte erlauben keinen eindeutigen visuellen Rückbezug")
+        b = bounds(address.cell_range or "")
+        if address.document != "original" or not s or not b:
+            add(subject,"excel_address","failed", "Blatt/Adresse/Dateiversion ungültig",address,"Keine gültige Excel-Fundstelle")
             return
-        expected_doc = "rendered_pdf" if "word_index" in manifest else "original"
-        page = next((p for p in manifest["pages"] if p["number"] == address.page),None)
-        valid = address.document == expected_doc and page is not None and address.sheet is None and address.cell_range is None
-        add(subject,"pdf_page","passed" if valid else "failed",expected_doc,address,"Seite 1-basiert und an tatsächliche PDF-Version gebunden")
-        if not valid: return
-        op = next((p for p in (di or {}).get("pages",[]) if p.get("pageNumber",p.get("page_number")) == address.page),{})
-        ocr_text = "\n".join(x.get("content","") for x in op.get("lines",[]))
+        cells = [(a,c) for a,c in s["cells"].items() if contains(address.cell_range,a)]
+        known_ranges = [r["range"] for r in s["blank_ranges"]]+[r["range"] for r in s["merges"]]+[v for r in s["validations"] for v in r.get("sqref","").split()]
+        observed = covered(address.cell_range,known_ranges+list(s["cells"])+list(s.get("comments",{})))
+        add(subject,"excel_address","passed" if observed else "not_verifiable",observed,address.cell_range,"Strukturmanifest, kein ws.cell()-Existenztest; keine semantische Zielbestätigung")
+        for merge in s["merges"]:
+            if contains(merge["range"],address.cell_range):
+                add(subject,"merge_anchor","passed" if address.cell_range.replace("$","") in (merge["anchor"],merge["range"]) else "failed",merge,address.cell_range,"Verbundene Zellen verwenden den Anker")
         if not target:
-            method = "native" if norm(quote) and norm(quote) in norm(page["text"]) else "ocr" if norm(quote) and norm(quote) in norm(ocr_text) else None
-            add(subject,"source_quote","passed" if method else "not_verifiable",{"method":method,"native":page["text"],"ocr":ocr_text},quote,"Exakter Leerraumvergleich; OCR-Abweichungen bleiben unbestätigt")
-        if address.bbox is not None:
-            b = address.bbox
-            inside = len(b)==4 and 0 <= b[0] < b[2] <= page["width"] and 0 <= b[1] < b[3] <= page["height"]
-            add(subject,"pdf_bounds","passed" if inside else "failed",[page["width"],page["height"]],b,"Unrotierte MediaBox-Punkte; lediglich Bereichsgrenzen geprüft")
-            if inside and not target:
-                transformed = [(line.get("content",""),ocr_polygon_to_pdf(line.get("polygon"),op,page)) for line in op.get("lines",[])]
-                within = [text for text,r in transformed if r and b[0]-2<=r[0] and b[1]-2<=r[1] and b[2]+2>=r[2] and b[3]+2>=r[3]]
-                supported = any(r for _,r in transformed)
-                match = bool(norm(quote)) and norm(quote) in norm("\n".join(within))
-                add(subject,"pdf_region_quote","passed" if match else "failed" if supported else "not_verifiable",transformed,quote,"OCR-Inch ×72, inverse Seitenrotation; MediaBox-Maßprüfung, 2-Punkt-Toleranz; keine Pixel-Schätzung")
-            add(subject,"pdf_precise_location","not_verifiable",op.get("unit"),b,"Modellkoordinaten sind keine präzise Schreibposition; OCR-Rotation/Einheiten werden nicht gleichgesetzt")
-        if address.form_field:
-            form = manifest["form_fields"].get(address.form_field)
-            add(subject,"pdf_form_field","passed" if form else "failed",form,address.form_field,"Native Formularstruktur; keine erfundenen Felder")
-            if form and form.get("pages"):
-                add(subject,"pdf_form_page","passed" if address.page in form["pages"] else "failed",form["pages"],address.page,"Formularwidget muss auf der behaupteten Seite liegen")
-        if target and "word_index" in manifest:
-            add(subject,"word_pdf_mapping","not_verifiable","Nur Word-PDF-Adresse",address,"Originaladresse ungeklärt; PDF-Koordinaten sind keine Word-Schreibposition")
-
+            texts = []
+            for a,c in cells:
+                texts.extend([c.get("value"),c.get("cached_value"), (c.get("formula") or {}).get("text"),s.get("comments",{}).get(a,{}).get("text")])
+            texts.append(s.get("comments",{}).get(address.cell_range,{}).get("text"))
+            text = "\n".join(str(t) for t in texts if t is not None)
+            add(subject,"source_quote",text_outcome(text,quote,substring=True),text,quote,
+                "Excel-Zeilenumbrüche normalisiert; minimale Schreibabweichungen sind Hinweise, keine bestätigten Zitate")
+        if target:
+            styles = [c["style"] for _,c in cells]+[r["style"] for r in s["blank_ranges"] if contains(r["range"],address.cell_range)]
+            if any(c.get("formula") for _,c in cells): add(subject,"formula_target","failed","Formelzelle",address.cell_range,"Formeln nicht überschreiben")
+            if s["protected"] and any(manifest["styles"][str(st)]["locked"] for st in styles): add(subject,"protected_target","failed","Aktiver Blattschutz + locked",address.cell_range,"Geschütztes Ziel")
+        return
     for ref in candidate.source_references:
         source_check(ref.id,ref.address,ref.quote)
     for q in candidate.questions:
         if not q.source_ids: add(q.id,"missing_source","failed",[],q.original,"Frage benötigt eine Quelle")
+        if any(sid not in refs for sid in q.note_source_ids):
+            add(q.id,"reference_integrity","failed",q.note_source_ids,"note_source_ids","Hinweisquelle fehlt")
+        if q.notes or q.note_source_ids:
+            quoted = "\n".join(refs[sid].quote for sid in q.note_source_ids if sid in refs)
+            outcome = text_outcome(quoted,q.notes) if q.notes and q.note_source_ids else "failed"
+            add(q.id,"notes_evidence",outcome,quoted,q.notes,
+                "Vollständige Hinweistexte; minimale Schreibabweichungen bleiben Hinweise für den Human Review")
         if any(x not in ids["position"] for x in q.position_ids) or any(x not in refs for x in q.context_source_ids): add(q.id,"reference_integrity","failed",q.position_ids,q.context_source_ids,"Kontext/Positionsverweis fehlt")
         if q.context_status == "unknown" or not q.context_source_ids: add(q.id,"unknown_context","not_verifiable",q.context_source_ids,q.context_status,"Kontext ist keine bestätigte Stammdatenzuordnung")
         if q.confidence is not None and not 0 <= q.confidence <= 1: add(q.id,"confidence_range","failed",q.confidence,"0..1","Unkalibrierte Modellangabe außerhalb Wertebereich")
@@ -188,40 +158,34 @@ def validate(candidate, manifest, di=None):
             continue
         source_check(f.id,f.address,"",target=True)
         options = sorted([o for o in candidate.options if o.field_id == f.id],key=lambda o:o.order)
-        if manifest["kind"] == "excel":
-            s = next((s for s in manifest["sheets"] if s["name"] == f.address.sheet),{})
-            rules = [r for r in s.get("validations",[]) if any(contains(rg,f.address.cell_range or "") for rg in r.get("sqref","").split())]
-            lists = [r for r in rules if r.get("type") == "list"]
-            if f.control_type == "excel_dropdown": add(f.id,"dropdown_type","passed" if lists else "failed",rules,f.control_type,"Nur echte list-Datavalidierung belegt Dropdown")
-            if lists:
-                expected = lists[0]["options"]
-                values = [o.value for o in options]
-                add(f.id,"dropdown_options","not_verifiable" if expected is None else "passed" if canonical(values)==canonical(expected) else "failed",expected,values,"Exakte typisierte Originalwerte und Reihenfolge; dynamische Regeln bleiben unbekannt")
-            elif options:
-                add(f.id,"printed_options","not_verifiable",None,[o.value for o in options],"Gedruckte Auswahl ist kein echtes Dropdown; Quellen separat geprüft")
-            for a in [a for a in candidate.attributes if a.owner_type == "field" and a.owner_id == f.id]:
-                if a.name in ("minimum","maximum","max_length","validation_rule"):
-                    matches = []
-                    for r in rules:
-                        if a.name == "validation_rule": matches.append(str(a.value) in (r.get("formula1"),r.get("formula2"),canonical({k:v for k,v in r.items() if k not in ("options","option_sources")})))
-                        elif r.get("type") in ("whole","decimal","date","time","textLength"):
-                            raw = r.get("formula2") if a.name in ("maximum","max_length") and r.get("operator","between") == "between" else r.get("formula1")
-                            permitted = (a.name == "minimum" and r.get("operator","between") in ("between","greaterThanOrEqual")) or (a.name == "maximum" and r.get("operator","between") in ("between","lessThanOrEqual")) or (a.name == "max_length" and r.get("type") == "textLength" and r.get("operator","between") in ("between","lessThanOrEqual"))
-                            try:
-                                if permitted: matches.append(float(raw)==float(a.value))
-                            except (ValueError,TypeError): pass
-                    add(f.id,"validation_rule","passed" if any(matches) else "failed" if matches else "not_verifiable",rules,a.model_dump(),"Originalregeln erhalten; dynamische Formeln nicht ausgewertet; Datumsserien verwenden die Workbook-Epoche")
-        elif f.address.form_field:
-            form = manifest["form_fields"].get(f.address.form_field)
-            if form:
-                expected_type = {"/Tx":"pdf_text","/Ch":"pdf_choice","/Btn":"pdf_button"}.get(form["type"],"unknown")
-                add(f.id,"pdf_control_type","passed" if f.control_type == expected_type else "failed",expected_type,f.control_type,"Nativer Formularfeldtyp")
-                if form["options"]:
-                    expected = [v[0] if isinstance(v,list) else v for v in form["options"]]
-                    add(f.id,"pdf_options","passed" if [o.value for o in options]==expected else "failed",expected,[o.value for o in options],"Native Exportwerte")
-        if f.control_type == "word_control" and f.address.word_path:
-            control = next((x for x in manifest.get("word_index",[]) if x["path"]==f.address.word_path),{})
-            add(f.id,"word_control","passed" if control.get("control_ids") else "failed",control.get("control_ids"),f.control_type,"Inhaltssteuerelement-ID muss in der Originalstruktur vorkommen")
+        s = next((s for s in manifest["sheets"] if s["name"] == f.address.sheet),{})
+        rules = [r for r in s.get("validations",[]) if any(contains(rg,f.address.cell_range or "") for rg in r.get("sqref","").split())]
+        lists = [r for r in rules if r.get("type") == "list"]
+        if f.control_type == "excel_dropdown": add(f.id,"dropdown_type","passed" if lists else "failed",rules,f.control_type,"Nur echte list-Datavalidierung belegt Dropdown")
+        if lists:
+            expected = lists[0]["options"]
+            values = [o.value for o in options]
+            nonempty = lambda items: [x for x in items if x is not None and not (isinstance(x,str) and not x.strip())]
+            outcome = "not_verifiable"
+            if expected is not None:
+                actual_items, expected_items = nonempty(values), nonempty(expected)
+                outcome = "passed" if canonical(actual_items)==canonical(expected_items) else "not_verifiable" if Counter(map(canonical,actual_items))==Counter(map(canonical,expected_items)) else "failed"
+            add(f.id,"dropdown_options",outcome,expected,values,
+                "Leere Listenzellen ignoriert; fehlende oder veränderte nichtleere Werte sind Fehler, reine Reihenfolgeabweichungen Hinweise")
+        elif options:
+            add(f.id,"printed_options","not_verifiable",None,[o.value for o in options],"Gedruckte Auswahl ist kein echtes Dropdown; Quellen separat geprüft")
+        for a in [a for a in candidate.attributes if a.owner_type == "field" and a.owner_id == f.id]:
+            if a.name in ("minimum","maximum","max_length","validation_rule"):
+                matches = []
+                for r in rules:
+                    if a.name == "validation_rule": matches.append(str(a.value) in (r.get("formula1"),r.get("formula2"),canonical({k:v for k,v in r.items() if k not in ("options","option_sources")})))
+                    elif r.get("type") in ("whole","decimal","date","time","textLength"):
+                        raw = r.get("formula2") if a.name in ("maximum","max_length") and r.get("operator","between") == "between" else r.get("formula1")
+                        permitted = (a.name == "minimum" and r.get("operator","between") in ("between","greaterThanOrEqual")) or (a.name == "maximum" and r.get("operator","between") in ("between","lessThanOrEqual")) or (a.name == "max_length" and r.get("type") == "textLength" and r.get("operator","between") in ("between","lessThanOrEqual"))
+                        try:
+                            if permitted: matches.append(float(raw)==float(a.value))
+                        except (ValueError,TypeError): pass
+                add(f.id,"validation_rule","passed" if any(matches) else "failed" if matches else "not_verifiable",rules,a.model_dump(),"Originalregeln erhalten; dynamische Formeln nicht ausgewertet; Datumsserien verwenden die Workbook-Epoche")
     for i,f in enumerate(candidate.answer_fields):
         if not f.address: continue
         for g in candidate.answer_fields[i+1:]:
@@ -239,7 +203,8 @@ def validate(candidate, manifest, di=None):
         if kind == "source": continue
         for item in items:
             for check in source_checks:
-                if check.subject in getattr(item,"source_ids",[]): checks.append(check.model_copy(update={"subject":item.id}))
+                source_ids = getattr(item,"source_ids",[]) + getattr(item,"note_source_ids",[]) + getattr(item,"context_source_ids",[])
+                if check.subject in source_ids: checks.append(check.model_copy(update={"subject":item.id}))
     return checks
 
 
@@ -271,9 +236,9 @@ def enrich(candidate, manifest, document, run, checks):
         questions.append(FinalQuestion(**q.model_dump(),key=qkey,answer_fields=fields,attributes=qa,checks=[c for c in checks if c.subject==q.id]))
     counts = Counter(k for _,k in keys)
     for ident,k in keys:
-        if counts[k]>1: checks.append(Check(subject=ident,code="key_collision",result="failed",observed=k,claim=ident,reason="Identische kanonische Identität; keine textbasierte Deduplizierung"))
+        if counts[k]>1: checks.append(Check(subject=ident,code="key_collision",result="failed",severity="error",observed=k,claim=ident,reason="Identische kanonische Identität; keine textbasierte Deduplizierung"))
     for q in questions:
         q.checks = [c for c in checks if c.subject==q.id]
         for f in q.answer_fields: f.checks = [c for c in checks if c.subject==f.id]
-    return Result(schema_version="1",document=document,run=run,questions=questions,positions=candidate.positions,source_references=candidate.source_references,
+    return Result(schema_version=SCHEMA_VERSION,document=document,run=run,questions=questions,positions=candidate.positions,source_references=candidate.source_references,
         document_metadata=attrs("document","document"),limitations=candidate.limitations+manifest.get("limitations",[]))

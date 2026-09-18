@@ -5,7 +5,7 @@ host. Its entry point, func_tenderautomation(req), reads a name from the query
 string or JSON request body and returns a greeting or usage guidance. This
 endpoint is independent of the local tender extraction CLI.
 """
-# v1
+# v2
 import azure.functions as func
 import logging
 

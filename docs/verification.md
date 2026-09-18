@@ -1,4 +1,14 @@
-# Ausgeführte Prüfungen – 16.09.2026
+# Prüfstand – 17.09.2026
+
+Neuester Stand: **65 Offline-Tests bestanden in 9,39 Sekunden**. Wirksamer Request geprüft: `gpt-5.6-sol`, Reasoning `high`, `max_output_tokens=125000`, Timeout 900 Sekunden. Promptversion 6 mit schemafähigem, quellenvalidiertem Beispiel. Norwegian-Leser: seriell 43,95 Sekunden, automatisch parallel 16,40 Sekunden; vollständige Quellenmanifeste exakt identisch. Zweite Arbeitsmappe: 5089 Inhaltszellen, 0,19 bzw. 0,21 Sekunden, ebenfalls identische Manifeste. Kein neuer Azure-Livetest dieser Promptversion.
+
+## Vorheriger Stand der Bereinigung
+
+Aktueller Ablauf: ausschließlich XLSX, ein Sol-Aufruf und lokale Excel-Validierung. **58 Offline-Tests bestanden in 7,79 Sekunden**. CLI-Hilfe geprüft. Der Abbruch mit 78793 Gesamttokens wurde nachgebildet: 46025 Eingabetokens plus genau 32768 Ausgabetokens bei entsprechendem Ausgabelimit, davon 9302 Reasoning-Tokens. Request-Limit und Abbruchgrund werden protokolliert. Aktuell wirksame Einstellungen: 128000 Ausgabetokens, Reasoning high, Timeout 900 Sekunden. Kein Live-Azure-Aufruf für diese Bereinigung.
+
+## Historische Prüfungen – 16.09.2026
+
+Die folgenden Angaben dokumentieren den damaligen Implementierungsstand. Die dort genannte Modellkette und PDF-/Word-Verarbeitung wurden inzwischen entfernt; die damaligen Wheel-Artefakte entsprechen nicht dem aktuellen Code.
 
 Es wurden ausschließlich lokale und gemockte Prüfungen ausgeführt. Keine kostenpflichtigen Azure-Aufrufe, keine Cloudressourcen und keine fachliche Live-Extraktion.
 

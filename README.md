@@ -1,112 +1,95 @@
-# Lokale Tenderfragenextraktion
+# Tenderfragen aus Excel extrahieren
 
-Separates Python-Paket für genau eine `.xlsx`, `.pdf` oder `.docx` aus `sample_inputs/`. Die bestehende Azure Function App einschließlich `requirements.txt` bleibt unverändert. Enthalten sind ausschließlich Fragenextraktion, Prüfung auf übersehene Fragen und technische Quellenvalidierung. Kein Dataverse-Import, Matching, Antwortgenerieren oder Dokumentbefüllen.
+Das lokale Python-Paket verarbeitet eine `.xlsx` aus `sample_inputs/`: XML-Streaming, ein Sol-Aufruf für die gesamte Arbeitsmappe und lokale Quellenprüfung. Es erzeugt keine Antworten und verändert die Eingabedatei nicht. Die separate Azure Function App gehört nicht zu diesem Ablauf.
 
-## Installation
+## Installation und Start
 
-Python **3.10 oder neuer**. Implementierung und Offline-Tests wurden mit dem vorhandenen Python 3.10.10 geprüft. Eine eigene Umgebung hält die lokalen Zusatzabhängigkeiten von der Function-Laufzeit getrennt:
-
-```powershell
-python -m venv .venv-extraction
-.\.venv-extraction\Scripts\python.exe -m pip install -e ".[test]"
-Copy-Item .env.example .env
-```
-
-Alternativ mit einer bereits aktivierten geeigneten Umgebung: `python -m pip install -e ".[test]"`. Für diese Implementierung wurde die vorhandene `.venv` verwendet; keine Function-Quelldatei oder Function-Abhängigkeitsdeklaration wurde geändert. Das offizielle OpenAI-SDK **3.14.1** wurde getestet; zulässiger Bereich `>=3.14.1,<4`. Promptdateien sind Paketdaten und werden auch aus einem installierten Wheel geladen.
-
-In `.env` OpenAI-base_url, Schlüssel und tatsächliche Azure-Deploymentnamen für Luna/Terra/Sol eintragen. Beispiel-URL: `https://YOUR-RESOURCE.openai.azure.com/openai/v1/`; der Foundry-Projektendpunkt `/api/projects/...` ist ungeeignet. Deploymentnamen sind frei konfigurierbar, keine behauptete automatische Modellbereitstellung. `local.settings.json` wird nicht als Konfigurationsquelle gelesen.
-
-PDF/Word benötigen zusätzlich Document-Intelligence-Endpunkt, Schlüssel und API-Version (`2024-11-30`). Excel benötigt weder diesen Dienst noch LibreOffice. Word benötigt lokal LibreOffice:
+Python 3.10 oder neuer, aus dem Projektverzeichnis:
 
 ```powershell
-winget install TheDocumentFoundation.LibreOffice
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
 ```
 
-Danach in `.env` beispielsweise `LIBREOFFICE_PATH=C:/Program Files/LibreOffice/program/soffice.exe` setzen. Die Konvertierung nutzt eine Kopie, ein isoliertes temporäres Profil, Argumentlisten ohne Shell und einen Timeout. Die entstandene PDF wird geprüft und im Laufverzeichnis aufbewahrt.
+Eine `.env` im Projektverzeichnis anlegen:
 
-## Einzeldatei starten
+```dotenv
+AZURE_OPENAI_BASE_URL=https://YOUR-RESOURCE.openai.azure.com/openai/v1/
+AZURE_OPENAI_API_KEY=YOUR-KEY
+AZURE_OPENAI_DEPLOYMENT_SOL=YOUR-SOL-DEPLOYMENT
+REASONING_SOL_EXTRACTION=high
+EXTRACTION_MAX_OUTPUT_TOKENS=125000
+OPENAI_TIMEOUT_SECONDS=900
+```
 
-Aus dem Projektverzeichnis, mit konfigurierter `.env`:
+Die Projekt-`.env` wird bei jedem Start frisch gelesen und hat Vorrang vor geerbten Umgebungsvariablen. Fehlt ein Eintrag, gilt die Umgebungsvariable, danach der Standardwert. Ein Terminal-Neustart ist bei ?nderungen an `.env` nicht erforderlich. `local.settings.json` wird nicht gelesen. Keine weiteren Modelldeployments, Document Intelligence oder LibreOffice sind nötig.
 
 ```powershell
-.\.venv\Scripts\python.exe -m tender_extraction --input "sample_inputs/Questions EVER Pharma Norwegian tender.xlsx" --output-dir "outputs"
+.\.venv\Scripts\python.exe -m tender_extraction --input "sample_inputs/Questions EVER Pharma Norwegian tender.xlsx" --output-dir outputs
 ```
 
-Mit aktivierter Umgebung lautet derselbe Befehl:
+Dieser Befehl ruft Azure auf. Der Startpunkt ist `src/tender_extraction/__main__.py`, die Argumentverarbeitung liegt in `cli.py`. Optionen:
 
-```powershell
-python -m tender_extraction --input "sample_inputs/Questions EVER Pharma Norwegian tender.xlsx" --output-dir "outputs"
-```
+| Option | Bedeutung |
+|---|---|
+| `--input` | Erforderlich: eine `.xlsx` innerhalb `sample_inputs/` |
+| `--output-dir` | Ausgabeordner, Standard `outputs` |
+| `--help` | Hilfe ohne Verarbeitung |
 
-**Dieser Startbefehl ruft kostenpflichtige Azure-Dienste auf. Er wurde während der Implementierung nicht ausgeführt.** Ohne `--input` erscheint ein Argumentfehler; es gibt keine automatische Stapelverarbeitung. Unterordner, Unicode und Leerzeichen sind zulässig; Wildcards, `..` und Symlink-Ausbrüche werden abgewiesen. Start aus dem Projektverzeichnis ist erforderlich, damit `sample_inputs/` und `.env` eindeutig sind.
+Keine Stapelverarbeitung und keine Unterstützung für `.xls`, PDF oder Word. Die Konsole zeigt vor dem Request Deployment, Reasoning, tatsächlich gesendetes Ausgabelimit und Timeout.
 
-Zu Beginn lagen weder `sample_inputs/` noch das Datenmodell im Repository. Das im Downloadordner vorhandene Excel-Beispiel wurde unverändert nach `sample_inputs/` kopiert, das Datenmodell nach `docs/`. Die Originaldateien bleiben erhalten. Nur dieses gefundene Excel-Beispiel wurde lokal strukturell analysiert. Es besitzt fünf Produktblätter mit sehr großen formatierten Leerbereichen. Es wurden keine echten `.xls`-/`.doc`-Samples bereitgestellt; diese Formate sind nicht unterstützt und benötigen eine gesonderte, geprüfte Konvertierungserweiterung. Synthetische Testdaten werden ausschließlich in temporären Testordnern erzeugt.
+## Verarbeitung und Ergebnisse
 
-## Ablauf und Ergebnisse
+Expat liest die gespeicherten `<c>`-Elemente der Worksheet-XMLs. Es gibt keinen rechteckigen Scan über `max_row × max_column` und keinen vollständigen Blattbaum. Leere Formatierungszellen werden zu lokalen Bereichen komprimiert und nicht an Sol gesendet. Ihre XML-Bytes müssen weiterhin aus der ZIP-Datei gelesen werden.
 
-Excel: Luna extrahiert, ein separater Terra-Aufruf prüft ausschließlich auf fehlende Fragen und Antwortkontexte. PDF/Word: Terra extrahiert und ein neuer Terra-Aufruf prüft. Jeder Aufruf erhält die vollständige Quelle erneut; PDF als tatsächliches `input_file` mit Base64-Daten, Word als exakt dieselbe erzeugte PDF plus Originalstrukturindex.
+Ab 64 MiB entpacktem Tabellen-XML werden mehrere Blätter mit bis zu vier lokalen Prozessen parallel gelesen. Kleine Arbeitsmappen werden ohne Prozessstart verarbeitet. Die Blattreihenfolge und blattübergreifenden Dropdownquellen bleiben erhalten. Das verändert nicht die Anzahl der Modellanfragen: Es bleibt genau ein Sol-Aufruf. `run.excel_read_seconds` zeigt die Lesezeit getrennt von der Modelllaufzeit.
 
-Nur `missing_found` startet einmal Sol mit der gesamten Quelle und ohne alten Fragenkatalog. Sol ersetzt den bisherigen Kandidaten vollständig. Danach erfolgt kein weiterer LLM-Aufruf. Für PDF/Word folgt genau eine Analyse derselben PDF mit Document Intelligence `prebuilt-layout`, deren Ergebnis in der Python-Validierung wiederverwendet wird. Normalfall zwei, bei Lücken drei fachliche OpenAI-Aufrufe; zusätzlich nur begrenzte SDK-Retries bei vorübergehenden Transportfehlern. Keine fachlichen Reparaturschleifen.
+Alle tatsächlichen Zellinhalte bleiben erhalten, auch weit unten oder rechts und auf versteckten Blättern. Die kompakte Übergabe enthält Zelladressen und Werte, Formeln mit Caches, relevante Zahlenformate, Kommentare, Merges, Sichtbarkeit und Dropdownregeln. Der Parser filtert nicht semantisch nach vermeintlichen Fragen. Feste Spaltenüberschriften, Medikamentnamen, Sprachen oder Soll-Fragenzahlen sind nicht eingebaut.
 
-Jeder Lauf erhält ein neues Verzeichnis `outputs/<run_id>/`:
+Sol erhält die gesamte Arbeitsmappe in einem Request. Python prüft anschließend Quellenzitate, Adressen, Verweise, Optionen und weitere strukturell belegbare Angaben. Es gibt keine zweite Modellprüfung oder Eskalation.
 
-```text
-result.json                         angereicherter finaler Kandidat mit Laufstatus
-validation_report.json              strukturierte technische Einzelprüfungen
-run_manifest.json                   Stufen, Konfiguration ohne Schlüssel, Nutzung
-source.xlsx / source.pdf / source.docx   unveränderte Eingabekopie
-source_manifest.json                vollständige strukturelle Quelldarstellung
-initial_candidate.json              Diagnose: erste Extraktion
-completeness_review.json            vorausgehende Terra-Prüfung
-sol_candidate.json                  nur bei Eskalation
-*_response_diagnostic.json          Antwortstatus, JSON/Fehlerdetails und Nutzung
-rendered.pdf                        nur Word: festgehaltene Konvertierung
-document_intelligence.json          nur PDF/Word: OCR/Layout-Ergebnis
-```
+Promptversion 6 trennt Auftrag, Feldregeln, Kontextzuordnung und Eingabeformat und enthält ein vollständiges, synthetisches JSON-Beispiel. Die API bekommt weiterhin ein strenges [Structured-Outputs-Schema](https://developers.openai.com/api/docs/guides/structured-outputs); Antworten werden lokal gegen dasselbe Schema geprüft. Das sichert die Datenstruktur, nicht die fachliche Vollständigkeit jeder Modellantwort.
 
-`completed` (Exitcode 0) heißt: vereinbarte Schritte abgeschlossen, keine dokumentierten technischen Prüfprobleme. Es ist **keine fachliche Freigabe oder Vollständigkeitsgarantie**. `needs_review` (Exitcode 2) kennzeichnet unter anderem unklare Vollständigkeitsprüfung, fehlende Ziele, unbekannten Kontext, nicht verifizierbare oder widersprüchliche Quellenangaben. `failed` (Exitcode 1) kennzeichnet technische/API-/Schemafehler. Ein fehlgeschlagener Lauf hat keine finalen Fragen; erhaltene Kandidaten sind ausschließlich Diagnoseartefakte. Ein Sol-Fehler führt niemals zum Rückfall auf die Erstextraktion.
+Jeder Lauf erstellt ein eigenes Verzeichnis `outputs/<run_id>/`:
 
-## Konfiguration und Limits
+- `sol_questions.json`: vollständige, schemafähige Sol-Antwort vor der lokalen Validierung.
+- `result.json`: Endergebnis mit verschachtelten Antwortfeldern, Produktpositionen, Quellen, Prüfungen und Laufdaten.
 
-Alle Einstellungen stehen in `.env.example`. Startwerte: Luna-Erstextraktion `medium`, Terra-Erstextraktion und -Prüfung sowie Sol `high`; Timeout 300 Sekunden, SDK-Retries 2, Extraktions-Ausgabelimit 32768 Tokens, Prüferlimit 8192 Tokens. Reasoning kann das Ausgabelimit mitverbrauchen. Diese Startwerte sind keine empirisch optimierten Qualitätsgarantien.
+Bei einer abgeschnittenen oder ungültigen Modellantwort entsteht kein Teilkandidat. `result.json` enthält dann `failed`, den Fehler und keine finalen Fragen. Quelldateikopie und Manifest bleiben temporär; bestehende Ergebnisse werden nicht verändert.
 
-`MAX_SOURCE_BYTES=100000000` begrenzt die lokale Eingabedatei, `MAX_INPUT_BYTES=20000000` den vollständig serialisierten Request einschließlich Schema und Prüfkandidat. Das ist eine zusätzliche lokale Schutzgrenze, keine Tokenzählung oder Zusicherung des deploymentabhängigen Kontextfensters. Weitere Azure-Limits werden als Fehler gemeldet. Kein Abschneiden von Blättern/Seiten, keine automatische Zerlegung, kein stiller Modellwechsel. Datenvalidierungs-Optionsbereiche über 100000 Zellen bleiben als Rohregel mit Einschränkung erhalten; echte Zellinhalte werden trotzdem vollständig aufgenommen.
+Auch eine technisch abgeschlossene Modellantwort ohne Fragen und mit gemeldeten Einschränkungen gilt als `failed` (`empty_extraction`). Die unveränderte Modellantwort bleibt dann in `sol_questions.json` zur Diagnose erhalten. `completed` vom API-Dienst allein bestätigt keine brauchbare Extraktion.
 
-Die Anwendung sendet `store=false`, keine Tools, Suchdienste, gespeicherten Chats oder `previous_response_id`. Dies ist keine Zusicherung vollständiger Nicht-Speicherung durch Azure. `.env`, `outputs/`, temporäre Umgebungen und lokale Samples sind von Git ausgeschlossen. Ausgaben enthalten sensible Quelldaten und bleiben lokal; normale Konsolenausgabe enthält nur Status, Verzeichnis und kurze Fehlerkategorie.
+Jede Frage enthält `notes` und `note_source_ids` für originale Antwortanweisungen samt Belegen. `position_ids` verbindet sie mit `positions`, beispielsweise Medikament, Stärke oder Packung; `context_source_ids` belegt ihren Kontext. Unbekannte Zuordnungen werden nicht erfunden. Schema-Version 3 verwendet Excel-Adressen mit `document`, `sheet` und `cell_range`; frühere PDF-/Word-Adressfelder entfallen. Details: [Extraktionsvertrag](docs/extraction_contract.md).
 
-## Prompt Caching
+Exitcodes: `0` = `completed`, `2` = `needs_review`, `1` = `failed`. Die Validierung verwendet `material_errors_only_v1`: Nur Prüfungen mit `severity="error"` lösen `needs_review` aus. Warnungen und allgemeine `limitations` bleiben sichtbar, blockieren aber nicht. `completed` bedeutet keine erkannten schwerwiegenden Fehler, keine fachliche Freigabe.
 
-`OPENAI_PROMPT_CACHE_MODE=explicit`, `OPENAI_PROMPT_CACHE_NAMESPACE=tender-extraction-v1`, `OPENAI_PROMPT_CACHE_TTL=30m` sind die Standardwerte. Ein stabiler developer-Block enthält `common.md` und den Aufgabenprompt. Genau ein Breakpoint steht an seinem Ende. Erst danach folgen variable user-Daten. Das strenge Schema wird separat mit `text.format` gesendet. Cachefelder werden über das dokumentierte SDK-`extra_body` übertragen; HTTP-Mocktests prüfen den serialisierten Request.
+Excel-Zeilenumbruch-Escapes werden beim Vergleich normalisiert, leere Dropdown-Einträge ignoriert. Minimale Schreibabweichungen in langen Wörtern und reine Optionsreihenfolge-Abweichungen sind Warnungen. Fehlende Verweise, doppelte IDs, ungültige Adressen, fehlende echte Auswahlwerte und deutliche Textabweichungen bleiben Fehler. Zahlenänderungen, ausgelassene Wörter und veränderte kurze Einheiten werden nicht als Schreibdetails toleriert. Der abschließende Human Review bleibt für die fachliche Prüfung zuständig.
 
-Der kurze Schlüssel `ta:<48 Hexzeichen>` beruht auf Namespace, Ressource/Deployment, Stufe, Excel/PDF/Word-PDF-Variante, Versionen, tatsächlichem Prompttext, deterministischem Schema und Reasoning. Keine Dateinamen, Dokumentinhalte, Datei-Hashes, Lauf-IDs, Zeiten oder Geheimnisse. Prompt-/Schemaänderungen ändern den Fingerprint auch ohne Versionsanpassung. Jede Stufe hat ihre eigene Cachegruppe.
+## Tokenbudget und Konfiguration
 
-`off` sendet weiterhin `prompt_cache_options.mode="explicit"`, aber keinen Breakpoint und keinen Key. Bei abgelehnten Cacheparametern folgt `cache_configuration_unsupported` mit konkretem Dienstfehler im lokalen Diagnoseartefakt; kein automatischer Fallback oder Wiederholungsaufruf. Keine Warm-ups, keine Zusatzaufrufe wegen Cache-Miss, kein lokaler KI-Ergebniscache und keine 24h-Retention. TTL ist keine Datenschutzrichtlinie.
+`EXTRACTION_MAX_OUTPUT_TOKENS=125000` begrenzt die Ausgabe einschließlich Reasoning. `total_tokens` umfasst dagegen Eingabe plus Ausgabe. Ein Lauf mit 46025 Eingabe- und 32768 Ausgabetokens hat 78793 Gesamttokens und kann trotzdem sein Ausgabelimit von 32768 erreicht haben.
 
-Pro tatsächlichem fachlichem Request speichert das Manifest Stufe, Deployment, zurückgemeldetes Modell, Cachemodus/Key/Fingerprint/TTL, Laufzeit und die vollständige zurückgelieferte `usage`. Ausgewertet werden `input_tokens`, `output_tokens`, `input_tokens_details.cached_tokens` und gegebenenfalls `cache_write_tokens`. Fehlendes bleibt null; `cache_hit` ist true bei >0, false bei explizit 0, sonst null. Cache-Writes sind keine Hits; gecachte Tokens sind schon in den Eingabetokens enthalten. SDK-interne Transportversuche werden nicht als zusätzliche fachliche Stufen ausgegeben.
+`run.calls` speichert das gesendete `max_output_tokens`, Reasoning, Timeout, Antwortstatus, Abbruchgrund, Laufzeit und vom Dienst gemeldete Nutzung, einschließlich `reasoning_tokens`. Ein höheres Budget reserviert keine feste Antwortlänge; große Antworten können weiterhin das Limit erreichen. Requests werden weder aufgeteilt noch inhaltlich abgeschnitten.
 
-Konfiguriertes Caching beweist keinen Treffer. Es gibt keine Einsparungsbehauptung und keinen Kostenrechner. Die Mindestpräfixlänge wird nicht durch Fülltext erzwungen. Die Implementierung folgt den dokumentierten [Azure-Cacheparametern](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/prompt-caching) und [OpenAI-Cachemechanismen](https://developers.openai.com/api/docs/guides/prompt-caching); Schemaaufbau nach [Azure Structured Outputs](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/structured-outputs). Geprüft am 16.09.2026; tatsächliche Deploymentunterstützung wurde nicht live getestet.
+Weitere Standardwerte:
 
-## Offline prüfen
+| Variable | Standard |
+|---|---|
+| `OPENAI_MAX_RETRIES` | `2` – begrenzte SDK-Transportwiederholungen |
+| `MAX_SOURCE_BYTES` | `100000000` – lokale Eingabedatei |
+| `MAX_INPUT_BYTES` | `20000000` – serialisierter Request einschließlich Schema |
+| `OPENAI_PROMPT_CACHE_MODE` | `explicit`, alternativ `off` |
+| `OPENAI_PROMPT_CACHE_NAMESPACE` | `tender-extraction-v1` |
+| `OPENAI_PROMPT_CACHE_TTL` | `30m` |
+
+Cachepräfixe hängen von Prompt, Schema, Deployment und Reasoning ab, nicht von Dateinhalten oder Geheimnissen. Es gibt keine Cache-Warm-ups oder Fallback-Aufrufe. Gemeldete Cache-Nutzung steht im Ergebnis. Die Anwendung sendet `store=false`. `.env`, lokale Eingaben und Ergebnisse gehören nicht in Git.
+
+## Offline testen
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Tests blockieren echte Socket-Verbindungen. Sie verwenden synthetische Excel-, PDF- und Wordstrukturen sowie Antworten über einen HTTP-Mock des offiziellen OpenAI-SDK. Geprüft werden Modellreihenfolge, Ersatz statt Zusammenführung, Sol-Fehler, unklare Prüferzustände, Quellen/Optionen/Kontext, Originalschutz, Pfadgrenzen und Cache-Requestdaten. Simulierte Treffer sind keine realen Azuremesswerte. Die separate lokale Analyse des tatsächlichen Excel-Beispiels benötigt ebenfalls keinen Azurezugang.
+Die Tests blockieren Netzwerkzugriffe und verwenden synthetische Arbeitsmappen sowie HTTP-Mocks. Sie prüfen Streaming, Inhaltserhalt, den einzelnen Sol-Request, Limits, Abbruchverhalten, Anmerkungen, Quellen und Pfadgrenzen. Ein Live-Azure-Test der aktuellen Bereinigung wurde nicht durchgeführt.
 
-Kein Livetest wurde beauftragt oder durchgeführt. Eine eigene `.env` mit den erforderlichen Zugängen fehlt derzeit; vorhandene Function-Geheimnisse werden nicht übernommen. Details des Vertrags, Datenmodellbezug und Validierungsgrenzen: [docs/extraction_contract.md](docs/extraction_contract.md).
-
-Tatsächlicher Abschlussstand: **61 Offline-Tests bestanden**, Wheel gebaut und isoliert installiert, Promptdateien und CLI aus dem installierten Paket geprüft. Zahlen und Prüfgrenzen stehen in [docs/verification.md](docs/verification.md).
-
-```text
-src/tender_extraction/  CLI, Konfiguration, Schema, Pipeline, Validierung
-  readers/             Excel-OOXML, Wordstruktur, PDF, lokale Konvertierung
-  services/            Azure Responses und Document Intelligence
-  prompts/             vier versionierte, installierbare Promptdateien
-tests/                 standardmäßig ausschließlich offline
-docs/                  Vertrag und Datenmodell
-sample_inputs/         lokale unveränderte Eingabekopien
-outputs/               lokale Laufartefakte und Analyseberichte
-```
-#   T e n d e r A u t o m a t i o n  
- 
+Lokaler Vergleich: Norwegian-Beispiel seriell 43,95 Sekunden, automatisch parallel 16,40 Sekunden, jeweils 986 Inhaltszellen. Atosiban-Beispiel 0,19 bzw. 0,21 Sekunden, jeweils 5089 Inhaltszellen; dort bleibt die Verarbeitung wegen der geringen XML-Größe seriell. Die vollständigen Quellenmanifeste beider Verarbeitungspfade stimmten exakt überein. Dies sind Einzelmessungen des Lesers, keine Modell-Qualitätsmessungen. Aktuell: 65 Offline-Tests bestanden, einschließlich echter lokaler Parallelverarbeitung und Schema-/Quellenprüfung des Promptbeispiels.

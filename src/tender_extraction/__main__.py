@@ -6,4 +6,5 @@ file; a configured extraction run can make billable Azure API calls.
 """
 from .cli import main
 
-raise SystemExit(main())
+if __name__ == "__main__":
+    raise SystemExit(main())

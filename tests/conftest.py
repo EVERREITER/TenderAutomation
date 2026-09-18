@@ -2,7 +2,7 @@
 
 Pytest discovers the config and sample fixtures for test configuration and a
 small Excel workbook. The autouse no_network fixture blocks socket connections.
-address(), extraction(), and no_missing() construct reusable contract examples.
+address() and extraction() construct reusable contract examples.
 All sample files are created in temporary test directories, without Azure calls.
 """
 import socket
@@ -12,7 +12,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.styles import PatternFill
 from tender_extraction.config import Config
-from tender_extraction.schemas import Address, SourceReference, Question, AnswerField, Extraction, Completeness
+from tender_extraction.schemas import Address, SourceReference, Question, AnswerField, Extraction
 
 
 @pytest.fixture(autouse=True)
@@ -24,16 +24,16 @@ def no_network(monkeypatch):
 
 @pytest.fixture
 def config():
-    return Config(base_url="https://example.openai.azure.com/openai/v1/",api_key="secret-test-token",deployments={"luna":"dep-l","terra":"dep-t","sol":"dep-s"},di_endpoint="https://example.cognitiveservices.azure.com",di_key="di-secret-test",retries=0)
+    return Config(base_url="https://example.openai.azure.com/openai/v1/",api_key="secret-test-token",deployments={"sol":"dep-s"},retries=0)
 
 
 def address(cell="A1",**changes):
-    return Address(**({"document":"original","sheet":"Fragen","cell_range":cell,"page":None,"bbox":None,"word_path":None,"form_field":None}|changes))
+    return Address(**({"document":"original","sheet":"Fragen","cell_range":cell}|changes))
 
 
 def extraction():
     refs = [SourceReference(id="s1",address=address(),quote="Provide pH"),SourceReference(id="ctx",address=address("C1"),quote="Product A")]
-    q = Question(id="q1",original="Provide pH",normalized="Provide pH",language="en",kind="information",section=None,number=None,order=1,source_ids=["s1"],context_status="extracted",context_source_ids=["ctx"],position_ids=[],subquestion=None,expected_answer="number",confidence=None)
+    q = Question(id="q1",original="Provide pH",normalized="Provide pH",notes=None,note_source_ids=[],language="en",kind="information",section=None,number=None,order=1,source_ids=["s1"],context_status="extracted",context_source_ids=["ctx"],position_ids=[],subquestion=None,expected_answer="number",confidence=None)
     f = AnswerField(id="f1",question_id="q1",label="pH",role="main_answer",semantic_type="number",control_type="excel_cell",target_status="located",address=address("B1"),order=1,source_ids=["s1"])
     return Extraction(questions=[q],answer_fields=[f],options=[],source_references=refs,positions=[],attributes=[],limitations=[])
 
@@ -55,6 +55,3 @@ def sample(tmp_path):
     s.row_dimensions[7].hidden=True; s.column_dimensions["E"].hidden=True
     w.save(p); w.close()
     return tmp_path,p
-
-
-def no_missing(): return Completeness(review_status="no_missing_found",missing_items=[],limitations=[])

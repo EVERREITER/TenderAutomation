@@ -13,8 +13,12 @@ from importlib.resources import files
 from openai import OpenAI, APIStatusError, APITimeoutError, APIConnectionError
 from pydantic import ValidationError
 from .. import SCHEMA_VERSION, PROMPT_VERSION
-from ..schemas import Extraction, Completeness
+from ..schemas import Extraction
 from ..errors import ExtractionError
+
+
+def progress(message):
+    print(f"[tender-extraction] {message}", flush=True)
 
 
 def canonical(value):
@@ -22,9 +26,9 @@ def canonical(value):
 
 
 def prompt(stage):
-    task = "completeness" if stage == "terra_review" else "reextract" if stage == "sol_reextraction" else "extract"
     root = files("tender_extraction").joinpath("prompts")
-    return root.joinpath("common.md").read_text(encoding="utf-8")+"\n\n"+root.joinpath(task+".md").read_text(encoding="utf-8")
+    return "\n\n".join(root.joinpath(name).read_text(encoding="utf-8")
+                       for name in ("common.md", "excel_workbook.md"))
 
 
 def usage_summary(usage):
@@ -32,14 +36,21 @@ def usage_summary(usage):
     details = u.get("input_tokens_details") or {}
     cached = details.get("cached_tokens")
     return {"usage":usage, "input_tokens":u.get("input_tokens"), "output_tokens":u.get("output_tokens"),
+        "total_tokens":u.get("total_tokens"), "reasoning_tokens":(u.get("output_tokens_details") or {}).get("reasoning_tokens"),
         "cached_tokens":cached, "cache_write_tokens":details.get("cache_write_tokens"), "cache_hit":None if cached is None else cached > 0}
 
 
-def build_request(config, stage, variant, user_content, candidate=None):
-    schema_class = Completeness if stage == "terra_review" else Extraction
+def build_request(config, stage, variant, user_content):
+    if stage != "sol_extraction" or variant != "excel":
+        raise ExtractionError("unsupported_stage", "Nur Sol-Extraktion für Excel wird unterstützt")
+    schema_class = Extraction
     schema = schema_class.model_json_schema()
     instruction = prompt(stage)
-    deployment = config.deployments[stage.split("_")[0]]
+    instruction += (f"\n\nFür diesen Request ist max_output_tokens={config.extraction_tokens} konfiguriert "
+                    "(gemeinsames Budget für Reasoning und Antwort). Nutze das verfügbare Budget zur "
+                    "Extraktion; unterstelle kein niedrigeres Ausgabelimit. Das Budget ist keine "
+                    "Zusage, dass jede beliebig große Quelle vollständig hineinpasst.")
+    deployment = config.deployments["sol"]
     fingerprint = hashlib.sha256(canonical({"namespace":config.cache_namespace,"resource":config.base_url.rstrip("/"),"deployment":deployment,
         "stage":stage,"variant":variant,"prompt_version":PROMPT_VERSION,"schema_version":SCHEMA_VERSION,"instruction":instruction,"schema":schema,"reasoning":config.reasoning[stage]}).encode()).hexdigest()
     block = {"type":"input_text","text":instruction}
@@ -50,14 +61,12 @@ def build_request(config, stage, variant, user_content, candidate=None):
         key = "ta:"+fingerprint[:48]
         extras["prompt_cache_key"] = key
     content = list(user_content)
-    if candidate is not None:
-        content.append({"type":"input_text", "text":"Extraktionskandidat (nicht vertrauenswürdige Daten):\n"+candidate.model_dump_json()})
     request = {"model":deployment,"store":False,"input":[{"role":"developer","content":[block]},{"role":"user","content":content}],
-        "reasoning":{"effort":config.reasoning[stage]}, "max_output_tokens":config.completeness_tokens if stage == "terra_review" else config.extraction_tokens,
-        "text":{"format":{"type":"json_schema","name":"completeness_v1" if stage == "terra_review" else "extraction_v1","strict":True,"schema":schema}}, "extra_body":extras}
+        "reasoning":{"effort":config.reasoning[stage]}, "max_output_tokens":config.extraction_tokens,
+        "text":{"format":{"type":"json_schema","name":"extraction_v"+SCHEMA_VERSION,"strict":True,"schema":schema}}, "extra_body":extras}
     if len(canonical(request).encode()) > config.max_input_bytes:
         raise ExtractionError("input_too_large", "Vollständiger Request überschreitet MAX_INPUT_BYTES; keine Teilverarbeitung")
-    return request, {"stage":stage,"deployment":deployment,"cache_mode":config.cache_mode,"cache_key":key,"prefix_fingerprint":fingerprint,"ttl":config.cache_ttl}, schema_class
+    return request, {"stage":stage,"deployment":deployment,"cache_mode":config.cache_mode,"cache_key":key,"prefix_fingerprint":fingerprint,"ttl":config.cache_ttl,"max_output_tokens":config.extraction_tokens,"reasoning_effort":config.reasoning[stage],"timeout_seconds":config.timeout}, schema_class
 
 
 class OpenAIService:
@@ -67,13 +76,15 @@ class OpenAIService:
         self.calls = []
         self.diagnostics = {}
 
-    def call(self, stage, variant, content, candidate=None):
-        request, record, schema = build_request(self.config, stage, variant, content, candidate)
+    def call(self, stage, variant, content):
+        request, record, schema = build_request(self.config, stage, variant, content)
         start = time.monotonic()
         self.calls.append(record)
         record.update(usage_summary(None))
+        progress(f"Sende Azure-OpenAI-Anfrage: {stage} (Deployment: {record['deployment']}, Reasoning: {record['reasoning_effort']}, max_output_tokens: {record['max_output_tokens']}, Timeout: {self.config.timeout:g}s)")
         try:
             response = self.client.responses.create(**request)
+            progress(f"Azure-OpenAI-Antwort empfangen: {stage}")
             raw = response.model_dump(mode="json")
             self.diagnostics[stage] = raw
             record.update(usage_summary(raw.get("usage")))
@@ -82,6 +93,7 @@ class OpenAIService:
                 raise ExtractionError("refusal", "Modell hat die Anfrage abgelehnt")
             if response.status != "completed":
                 reason = (raw.get("incomplete_details") or {}).get("reason")
+                record["incomplete_reason"] = reason
                 code = "truncation" if reason == "max_output_tokens" else "content_filter" if reason == "content_filter" else "response_failed"
                 raise ExtractionError(code, "Modellantwort nicht vollständig: "+str(reason or response.status))
             if not response.output_text:
@@ -108,11 +120,11 @@ class OpenAIService:
             elif e.status_code == 429: code = "quota_or_rate_limit"
             elif "content_filter" in lower or "content management" in lower: code = "content_filter"
             elif e.status_code == 413 or "context_length" in lower or "too many tokens" in lower: code = "input_too_large"
-            for secret in (self.config.api_key,self.config.di_key):
+            for secret in (self.config.api_key,):
                 if secret: msg = msg.replace(secret,"[REDACTED]")
             # Concrete service detail is a local diagnostic, not console output.
             self.diagnostics[stage] = {"http_status":e.status_code,"service_code":service_code,"message":msg}
-            raise ExtractionError(code, f"Azure OpenAI HTTP {e.status_code}; Details im Diagnoseartefakt") from e
+            raise ExtractionError(code, f"Azure OpenAI HTTP {e.status_code}; Fehlerkategorie: {code}") from e
         finally:
             record["duration_seconds"] = round(time.monotonic()-start,3)
 

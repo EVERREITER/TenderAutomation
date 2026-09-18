@@ -5,5 +5,5 @@ contracts in run manifests and cache fingerprints. This module has no callable
 entry point and performs no file processing or cloud calls when imported.
 """
 VERSION = "0.1.0"
-SCHEMA_VERSION = "1"
-PROMPT_VERSION = "1"
+SCHEMA_VERSION = "3"
+PROMPT_VERSION = "6"

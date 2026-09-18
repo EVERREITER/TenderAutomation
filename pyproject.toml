@@ -7,7 +7,7 @@ name = "tender-extraction"
 version = "0.1.0"
 description = "Local, source-grounded tender question extraction"
 requires-python = ">=3.10"
-dependencies = ["openai>=3.14.1,<4", "pydantic>=2.13,<3", "openpyxl>=3.1.5,<4", "pypdf>=6.19,<7", "python-dotenv>=1.2,<2", "azure-ai-documentintelligence>=1.0.2,<2"]
+dependencies = ["openai>=3.14.1,<4", "pydantic>=2.13,<3", "openpyxl>=3.1.5,<4", "python-dotenv>=1.2,<2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]

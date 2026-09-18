@@ -1,25 +1,21 @@
-"""Orchestrate extraction, completeness review, and source validation.
-
-run_file() is the main entry point. It validates a selected input, snapshots the
-source, prepares Excel or PDF/Word input, runs the prescribed Azure model chain,
-and writes isolated run artifacts. Only a missing-question review triggers a
-complete Sol replacement. selected_input() enforces the sample_inputs boundary;
-digest() calculates file fingerprints. Failed runs never promote old candidates.
-"""
-import base64
+"""Extract a complete Excel workbook with one Sol request and validate its sources."""
 import hashlib
 import json
 import shutil
+from time import perf_counter
+from tempfile import TemporaryDirectory
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 from . import VERSION, SCHEMA_VERSION, PROMPT_VERSION
 from .errors import ExtractionError
-from .readers.excel import read_excel
-from .readers.documents import read_pdf, word_index, convert_word
+from .readers.excel import read_excel, model_manifest
 from .services.openai_client import OpenAIService
-from .services.document_intelligence import analyze
-from .validation import validate, enrich
+from .validation import validate, enrich, validation_status
+
+
+def progress(message):
+    print(f"[tender-extraction] {message}", flush=True)
 
 
 def now():
@@ -46,14 +42,33 @@ def selected_input(value, project_root):
     resolved = p.resolve()
     if not resolved.is_relative_to(samples) or not resolved.is_file():
         raise ExtractionError("input_path", "Genau eine vorhandene Datei innerhalb sample_inputs/ auswählen")
-    if resolved.suffix.lower() not in (".xlsx",".docx",".pdf"):
-        raise ExtractionError("unsupported_format", "Unterstützt: .xlsx, .docx, .pdf. .xls/.doc benötigen eine gesonderte Konvertierungserweiterung")
+    if resolved.suffix.lower() != ".xlsx":
+        raise ExtractionError("unsupported_format", "Unterstützt: .xlsx. Bitte eine Excel-Arbeitsmappe auswählen.")
     return resolved, resolved.relative_to(samples).as_posix()
 
 
-def run_file(input_value, output_dir, config, project_root=None, service=None, di_analyze=analyze, converter=convert_word):
+def extract_excel(manifest, document, service, run, save):
+    compact = model_manifest(manifest)
+    run["final_extractor"] = "sol_extraction"
+    run["final_candidate_completeness"] = "Keine unabhängige semantische Vollständigkeitsprüfung durchgeführt"
+    payload = {"document": document, "source_manifest": compact}
+    source_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    run["excel_source"] = {"sheets": len(compact["sheets"]),
+                           "content_cells": sum(len(s["cells"]) for s in compact["sheets"]),
+                           "payload_bytes": len(source_text.encode("utf-8"))}
+    progress(f"Excel-Inhalt für einen Sol-Aufruf: {run['excel_source']['sheets']} Blätter, "
+             f"{run['excel_source']['content_cells']} Inhaltszellen, {run['excel_source']['payload_bytes']:,} Bytes")
+    run["stages"].append("sol_extraction")
+    candidate = service.call("sol_extraction", "excel", [{"type": "input_text", "text": source_text}])
+    save("sol_questions.json", candidate.model_dump())
+    return candidate
+
+
+def run_file(input_value, output_dir, config, project_root=None, service=None):
+    progress(f"Starte Verarbeitung: {input_value}")
     root = Path(project_root or Path.cwd()).resolve()
     path,family = selected_input(input_value,root)
+    progress(f"Eingabe validiert: {path.name} ({path.suffix.lower()})")
     output = Path(output_dir)
     output = (root/output).resolve() if not output.is_absolute() else output.resolve()
     if output.is_relative_to(root/"sample_inputs"):
@@ -61,75 +76,61 @@ def run_file(input_value, output_dir, config, project_root=None, service=None, d
     run_id = uuid4().hex
     folder = output/run_id
     folder.mkdir(parents=True,exist_ok=False)
+    progress(f"Aktiver Ausgabeordner: {folder}")
     run = {"run_id":run_id,"started_at":now(),"ended_at":None,"status":"failed","pipeline_version":VERSION,"schema_version":SCHEMA_VERSION,
-        "prompt_version":PROMPT_VERSION,"configuration":config.public(),"calls":[],"stages":[],"escalation_reason":None,"final_extractor":None,
-        "question_count":0,"prior_completeness_review":None,"final_candidate_completeness":"not_assessed","input_hash":digest(path)}
-    document = {"filename":path.name,"format":path.suffix.lower()[1:],"family":family,"sha256":run["input_hash"],"rendered_pdf":None}
+        "prompt_version":PROMPT_VERSION,"configuration":config.public(),"calls":[],"stages":[],"final_extractor":None,
+        "question_count":0,"final_candidate_completeness":"not_assessed","input_hash":digest(path)}
+    document = {"filename":path.name,"format":path.suffix.lower()[1:],"family":family,"sha256":run["input_hash"]}
     def save(name,value):
         text = json.dumps(value,ensure_ascii=False,indent=2,default=str,allow_nan=False)
-        for secret in (config.api_key,config.di_key):
+        for secret in (config.api_key,):
             if secret: text = text.replace(secret,"[REDACTED]")
-        (folder/name).write_text(text+"\n",encoding="utf-8")
+        try:
+            (folder/name).write_text(text+"\n",encoding="utf-8")
+        except FileNotFoundError:
+            # The output folder may have been removed while waiting for Sol.
+            # Retry the local write only; never repeat the model request.
+            folder.mkdir(parents=True, exist_ok=True)
+            progress(f"Ausgabeordner fehlte und wurde wiederhergestellt: {folder}")
+            (folder/name).write_text(text+"\n",encoding="utf-8")
     checks, result, owned = [], None, service is None
+    workspace = TemporaryDirectory(prefix="tender-extraction-")
     try:
+        progress("Konfiguration wird geprüft")
         config.validate(path.suffix.lower())
+        progress("Konfiguration ist gültig")
         if path.stat().st_size > config.max_source_bytes:
             raise ExtractionError("input_too_large", "Datei überschreitet MAX_SOURCE_BYTES; keine Teilverarbeitung")
         # Analyze a stable byte snapshot, not a file that could change between calls.
-        snapshot = folder/("source"+path.suffix.lower())
+        snapshot = Path(workspace.name)/("source"+path.suffix.lower())
+        progress("Erstelle unveränderliche Quelldatei (Snapshot)")
         shutil.copyfile(path,snapshot)
         if digest(snapshot) != run["input_hash"]:
             raise ExtractionError("source_changed", "Originaldatei wurde während der Aufnahme verändert")
-        if path.suffix.lower() == ".xlsx":
-            manifest = read_excel(snapshot)
-            variant = "excel"
-            content = [{"type":"input_text","text":json.dumps({"document":document,"source_manifest":manifest},ensure_ascii=False)}]
-            initial = "luna_extraction"
-            pdf = None
-        else:
-            pdf = converter(snapshot,folder,config.converter,config.timeout) if path.suffix.lower()==".docx" else snapshot
-            manifest = read_pdf(pdf)
-            variant = "word_pdf" if path.suffix.lower()==".docx" else "pdf"
-            if variant == "word_pdf":
-                manifest["word_index"] = word_index(snapshot)
-                document["rendered_pdf"] = {"filename":pdf.name,"sha256":digest(pdf),"source_sha256":document["sha256"]}
-            if pdf.stat().st_size > config.max_input_bytes:
-                raise ExtractionError("input_too_large", "Erzeugte PDF überschreitet MAX_INPUT_BYTES")
-            content = [{"type":"input_text","text":json.dumps({"document":document,"word_index":manifest.get("word_index"),"pdf_coordinates":manifest["coordinate_system"]},ensure_ascii=False)},
-                {"type":"input_file","filename":pdf.name,"file_data":"data:application/pdf;base64,"+base64.b64encode(pdf.read_bytes()).decode("ascii")}]
-            initial = "terra_extraction"
-        save("source_manifest.json",manifest)
+        progress("Lese Excel-Datei und erstelle Quellenmanifest")
+        read_started = perf_counter()
+        manifest = read_excel(snapshot)
+        run["excel_read_seconds"] = round(perf_counter() - read_started, 3)
+        progress(f"Excel-Datei gelesen in {run['excel_read_seconds']:.2f}s")
         service = service or OpenAIService(config)
-        run["stages"].append(initial)
-        candidate = service.call(initial,variant,content)
-        save("initial_candidate.json",candidate.model_dump())
-        run["stages"].append("terra_review")
-        review = service.call("terra_review",variant,content,candidate)
-        save("completeness_review.json",review.model_dump())
-        run["prior_completeness_review"] = review.model_dump()
-        run["final_extractor"] = initial
-        run["final_candidate_completeness"] = review.review_status
-        if review.review_status == "missing_found":
-            run["escalation_reason"] = "missing_found"
-            run["stages"].append("sol_reextraction")
-            run["final_extractor"] = "sol_reextraction"
-            run["final_candidate_completeness"] = "Keine erneute semantische Vollständigkeitsprüfung durchgeführt"
-            candidate = service.call("sol_reextraction",variant,content)
-            save("sol_candidate.json",candidate.model_dump())
-        di = None
-        if pdf:
-            run["stages"].append("document_intelligence")
-            di,di_record = di_analyze(pdf,config)
-            run["document_intelligence"] = di_record
-            save("document_intelligence.json",di)
+        candidate = extract_excel(manifest, document, service, run, save)
         run["stages"].append("python_validation")
-        checks = validate(candidate,manifest,di)
+        progress("Starte lokale Quellenprüfung und Ergebnisanreicherung")
+        checks = validate(candidate,manifest)
+        if not candidate.questions and candidate.limitations:
+            raise ExtractionError("empty_extraction",
+                "Sol hat keine Fragen extrahiert und Einschränkungen gemeldet. "
+                "Die Modellbegründung steht in sol_questions.json unter limitations; "
+                "dies ist kein verwertbarer Fragenkatalog.")
         result = enrich(candidate,manifest,document,run,checks)
+        progress("Lokale Prüfung abgeschlossen")
         run["question_count"] = len(candidate.questions)
-        run["status"] = "needs_review" if review.review_status == "unable_to_assess" or review.limitations or result.limitations or any(c.result in ("failed","not_verifiable") for c in checks) else "completed"
+        run["status"] = validation_status(checks)
+        run["validation_policy"] = "material_errors_only_v1"
         if digest(path) != run["input_hash"]:
-            raise ExtractionError("source_changed", "Originaldatei wurde während des Laufs extern verändert; Snapshot bleibt nachvollziehbar")
+            raise ExtractionError("source_changed", "Originaldatei wurde während des Laufs extern verändert; Ergebnis verworfen")
     except Exception as e:
+        progress(f"Verarbeitung fehlgeschlagen: {type(e).__name__}")
         run["status"] = "failed"
         run["error"] = {"code":e.code if isinstance(e,ExtractionError) else "local_processing_error", "message":str(e) if isinstance(e,ExtractionError) else type(e).__name__+": lokale Verarbeitung fehlgeschlagen"}
         result = None  # A previous candidate is never promoted on failure.
@@ -137,13 +138,15 @@ def run_file(input_value, output_dir, config, project_root=None, service=None, d
         run["ended_at"] = now()
         if service:
             run["calls"] = service.calls
-            for stage,raw in service.diagnostics.items(): save(stage+"_response_diagnostic.json",raw)
             if owned: service.close()
-        save("run_manifest.json",run)
-        save("validation_report.json",{"checks":[c.model_dump() for c in checks],"scope":"Technische Quellenprüfung; keine semantische Freigabe oder Vollständigkeitsgarantie"})
-        if result:
-            result.run = run
-            save("result.json",result.model_dump())
-        else:
-            save("result.json",{"schema_version":SCHEMA_VERSION,"document":document,"run":run,"questions":[],"candidate_only_artifacts":True})
+        run["validation_checks"] = [c.model_dump() for c in checks]
+        try:
+            if result:
+                result.run = run
+                save("result.json",result.model_dump())
+            else:
+                save("result.json",{"schema_version":SCHEMA_VERSION,"document":document,"run":run,"questions":[],"candidate_only_artifacts":True})
+        finally:
+            workspace.cleanup()
+        progress(f"Lauf beendet: {run['status']}; Ergebnisse: {folder}")
     return folder,run

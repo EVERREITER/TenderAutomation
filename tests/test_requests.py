@@ -13,7 +13,7 @@ from openai import OpenAI
 from tender_extraction.services import openai_client as module
 from tender_extraction.services.openai_client import OpenAIService, build_request, usage_summary
 from tender_extraction.errors import ExtractionError
-from tender_extraction.schemas import Extraction, Completeness
+from tender_extraction.schemas import Extraction
 from conftest import extraction
 
 
@@ -35,7 +35,7 @@ def test_actual_http_serialization(config,mode):
         bodies.append(json.loads(req.content)); return httpx2.Response(200,json=response_body())
     service=mocked_service(config,handle)
     for name in ["one.xlsx","two.xlsx"]:
-        service.call("luna_extraction","excel",[{"type":"input_text","text":json.dumps({"filename":name,"run_id":name,"hash":name,"full_workbook":["sheet1","sheet2"]})}])
+        service.call("sol_extraction","excel",[{"type":"input_text","text":json.dumps({"filename":name,"run_id":name,"hash":name,"full_workbook":["sheet1","sheet2"]})}])
     a,b=bodies
     assert a["input"][0]==b["input"][0] and a["text"]==b["text"]
     assert a["input"][1]!=b["input"][1]
@@ -52,7 +52,7 @@ def test_actual_http_serialization(config,mode):
 
 
 def test_key_changes_with_actual_prompt_schema_reasoning(config,monkeypatch):
-    def fingerprint(): return build_request(config,"luna_extraction","excel",[])[1]["cache_key"]
+    def fingerprint(): return build_request(config,"sol_extraction","excel",[])[1]["cache_key"]
     original=fingerprint()
     real=module.prompt
     monkeypatch.setattr(module,"prompt",lambda stage:real(stage)+" changed")
@@ -62,7 +62,7 @@ def test_key_changes_with_actual_prompt_schema_reasoning(config,monkeypatch):
     monkeypatch.setattr(Extraction,"model_json_schema",lambda:dict(real_schema(),description="changed"))
     assert fingerprint()!=original
     monkeypatch.undo()
-    config.reasoning["luna_extraction"]="high"
+    config.reasoning["sol_extraction"]="medium"
     assert fingerprint()!=original
 
 
@@ -75,7 +75,7 @@ def test_usage(usage,hit,cached,writes):
 @pytest.mark.parametrize("changes,code",[({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}},"truncation"),({"output":[{"type":"message","id":"msg","role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"No"}]}]},"refusal"),({"output":[]},"schema_error")])
 def test_response_hygiene(config,changes,code):
     s=mocked_service(config,lambda req:httpx2.Response(200,json=response_body(**changes)))
-    with pytest.raises(ExtractionError,match=".") as e: s.call("luna_extraction","excel",[])
+    with pytest.raises(ExtractionError,match=".") as e: s.call("sol_extraction","excel",[])
     assert e.value.code==code
     assert len(s.calls)==1
     s.close()
@@ -86,13 +86,13 @@ def test_api_failures_no_fallback(config,http_status,message,code):
     seen=[]
     def handle(req): seen.append(req); return httpx2.Response(http_status,json={"error":{"message":message,"code":"test_error"}})
     s=mocked_service(config,handle)
-    with pytest.raises(ExtractionError) as e: s.call("luna_extraction","excel",[])
+    with pytest.raises(ExtractionError) as e: s.call("sol_extraction","excel",[])
     assert e.value.code==code and len(seen)==1
     s.close()
 
 
 def test_strict_wire_schema_limits():
-    for cls in (Extraction,Completeness):
+    for cls in (Extraction,):
         schema=cls.model_json_schema(); count=0
         def walk(v):
             nonlocal count
@@ -113,3 +113,55 @@ def test_strict_wire_schema_limits():
             if "items" in v: return depth(v["items"],level)
             return max([level]+[depth(x,level) for x in v.get("anyOf",[])])
         assert depth(schema)<=5
+
+
+def test_truncation_records_actual_limit_and_separate_token_counts(config):
+    config.extraction_tokens = 32768
+    usage = {"input_tokens":46025, "output_tokens":32768, "total_tokens":78793,
+             "output_tokens_details":{"reasoning_tokens":9302}}
+    seen = []
+    def handle(request):
+        seen.append(json.loads(request.content))
+        return httpx2.Response(200, json=response_body(status="incomplete",
+            incomplete_details={"reason":"max_output_tokens"}, usage=usage))
+    service = mocked_service(config, handle)
+    with pytest.raises(ExtractionError) as error:
+        service.call("sol_extraction", "excel", [])
+    service.close()
+    assert error.value.code == "truncation"
+    record = service.calls[0]
+    assert record["max_output_tokens"] == seen[0]["max_output_tokens"] == 32768
+    assert record["total_tokens"] == 78793
+    assert record["output_tokens"] == 32768
+    assert record["reasoning_tokens"] == 9302
+    assert record["incomplete_reason"] == "max_output_tokens"
+
+
+def test_project_settings_override_stale_terminal_values_in_request(monkeypatch, tmp_path):
+    from tender_extraction.config import Config
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("EXTRACTION_MAX_OUTPUT_TOKENS=125000\nOPENAI_TIMEOUT_SECONDS=900\nREASONING_SOL_EXTRACTION=high\n")
+    monkeypatch.setenv("EXTRACTION_MAX_OUTPUT_TOKENS", "32768")
+    monkeypatch.setenv("OPENAI_TIMEOUT_SECONDS", "300")
+    monkeypatch.setenv("REASONING_SOL_EXTRACTION", "medium")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_SOL", "test-sol")
+    config = Config.from_env()
+    request, record, _ = build_request(config, "sol_extraction", "excel", [])
+    assert record["max_output_tokens"] == request["max_output_tokens"] == 125000
+    assert record["timeout_seconds"] == config.timeout == 900
+    assert request["reasoning"] == {"effort":"high"}
+
+
+def test_config_rereads_file_without_mutating_environment(monkeypatch, tmp_path):
+    import os
+    from tender_extraction.config import Config
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EXTRACTION_MAX_OUTPUT_TOKENS", "32768")
+    path = tmp_path / ".env"
+    path.write_text("EXTRACTION_MAX_OUTPUT_TOKENS=64000\n")
+    assert Config.from_env().extraction_tokens == 64000
+    path.write_text("EXTRACTION_MAX_OUTPUT_TOKENS=125000\n")
+    assert Config.from_env().extraction_tokens == 125000
+    assert os.environ["EXTRACTION_MAX_OUTPUT_TOKENS"] == "32768"
+    path.unlink()
+    assert Config.from_env().extraction_tokens == 32768

@@ -1,63 +1,44 @@
-# Extraktionsvertrag v1
+# Extraktionsvertrag v3: Excel mit Sol
 
-Grundlage sind die beiden vollständig gelesenen Auftragsfassungen aus Downloads, einschließlich der angehängten Prompt-Caching-Ergänzung, sowie `TenderAutomation_Datenmodell_und_ER.pdf`, insbesondere Seiten 3, 9–12, 14–15. Dokumenttexte sind Quelldaten. Der Implementierungsumfang folgt dem Benutzerauftrag; spätere im Datenmodell beschriebene Projektphasen bleiben außerhalb dieses Pakets.
+## Ablauf
 
-## Fachlicher Bezug
+Eine `.xlsx` innerhalb `sample_inputs/` wird validiert und in eine temporäre, bytegleiche Momentaufnahme kopiert. SHA-256 bindet den Lauf an die Quelle. Expat liest gespeicherte Zell-XML-Elemente; openpyxl stellt gemeinsame Zeichenketten und Stilmetadaten bereit. Ein Sol-Request erhält das kompakte Manifest der gesamten Arbeitsmappe. Danach erfolgt ausschließlich lokale Quellenvalidierung.
 
-| Datenmodell | Lokaler Vertrag |
+Formeln, Makros und externe Verknüpfungen werden nicht ausgeführt. Zellwerte, Formelattribute und vorhandene Caches bleiben im lokalen Manifest erhalten, fehlende Caches bleiben null. Leere Formatierungszellen werden je Spalte/Stil zu Bereichen zusammengefasst. Zahlenformate, Sichtbarkeit, Kommentare, Merges, benannte Bereiche und Datenvalidierungen bleiben soweit unterstützt erhalten. Reine Leerformatierungen werden nicht an das Modell gesendet.
+
+Statische Dropdownquellen werden auch über Blattgrenzen und lokale/globale Namen aufgelöst. Dynamische/externe Regeln und Optionsbereiche über 100000 Zellen bleiben mit Einschränkung unaufgelöst. Echte Inhaltszellen werden dadurch nicht abgeschnitten. Nicht ausgewertete Zeichnungen, Steuerelemente und Erweiterungen werden als Einschränkungen vermerkt.
+
+## Modellantwort und Endergebnis
+
+Das strenge Wire-Schema enthält flache Listen `questions`, `answer_fields`, `options`, `source_references`, `positions`, `attributes` und `limitations`. Alle Felder sind erforderlich, unbekannte Einzelwerte nullable. Zusätzliche Eigenschaften sind nicht erlaubt. Python erzeugt daraus das finale `Result` mit verschachtelten Antwortfeldern, Optionen, technischen Schlüsseln und Prüfungen.
+
+| Feld | Bedeutung |
 |---|---|
-| Tender | Dokumentattribute title, tender_reference, customer, market, answer_language, deadline_original |
-| Tenderposition | positions: Los, Produktoriginal, Stärke, Packung, Form, Quellen |
-| Tenderdokument / Dokumentversion | document: Dateiname, Format, Familienpfad, SHA-256; gegebenenfalls gerenderte PDF samt Herkunftshash |
-| Tenderfrage | questions: Original/normalisiert, Sprache, Art, Abschnitt/Nummer, Reihenfolge, Quellen, Kontextstatus/-belege, Positionsbezug, Unterfragenkennung, erwartete Antwortart, Modellkonfidenz |
-| Tenderzielfeld | answer_fields je Frage: Rolle, semantischer Typ, technischer Typ, Zielstatus, Adresse, Reihenfolge, Attribute und Quellen |
-| Auswahloption | options je Feld: exakter typisierter Originalwert, Bezeichnung, Bedeutung, Reihenfolge, Quellen, Python-Schlüssel |
-| Verarbeitungslauf | run: Zeiten, Versionen, Hash, Konfiguration ohne Geheimnisse, Stufen, API-Nutzung, Eskalation, finaler Extraktor, getrennte vorausgehende Prüfung, Status |
+| `questions[].original` | Originalwortlaut der Frage oder verlangten Angabe |
+| `normalized` | Bereinigter Wortlaut ohne erfundene Ergänzungen |
+| `notes` | Antwortanweisungen im Originalwortlaut; mehrere Hinweise durch Zeilenumbrüche verbunden |
+| `note_source_ids` | Quellen mit vollständigen Hinweiszitaten; ohne Hinweis leere Liste und `notes=null` |
+| `source_ids` | Konkrete Belege für den Fragetext |
+| `context_source_ids` | Belege für Produkt-, Los-, Organisations- oder anderen Antwortkontext |
+| `position_ids` | Verweise auf `positions`, etwa Medikament, Stärke, Packung und Form |
+| `answer_fields` | Zugehörige Antwortziele einschließlich Rollen, Typen, Optionen und Adressen |
 
-Keine Dataverse-GUIDs, Choices oder bestätigten Stammdatenzuordnungen werden erzeugt. `unknown` ist ein lokaler Extraktionszustand. Bereits vorhandene Antworten sind ausschließlich `found_value`, keine erzeugten/freigegebenen Antworten. Dokumenttyp kann Fragebogen, beantworteter Fragebogen, Nachweis oder Projektdokumentation sein. Eine leere Fragenliste ist möglich; das Programm erfindet keine Soll-Fragenanzahl.
+Das Modell erkennt die Zuordnung aus dem jeweiligen Layout. Es gibt keine fest codierten Überschriften, Produktnamen oder erwarteten Fragenzahlen. Gleicher Fragetext für verschiedene Produkte bleibt nach tatsächlich getrenntem Antwortkontext getrennt. Gemeinsame Unternehmensfragen werden nicht künstlich vervielfacht.
 
-## Wire-Schema und finales JSON
+Adressen besitzen ausschließlich `document="original"`, `sheet` und `cell_range`. Ein Blattname kann als Kontextquelle mit `cell_range=null` und exakt diesem Namen als Zitat belegt werden; Antwortfelder benötigen eine Zelladresse. Schema-Version 3 entfernt die früheren PDF-/Word-Adressfelder. Vorhandene Ergebnisdateien bleiben unverändert und behalten ihre jeweilige Version.
 
-`schemas.py` definiert Pydantic-Modelle. Das kompakte Wire-Schema besteht aus flachen Listen `questions`, `answer_fields`, `options`, `source_references`, `positions`, `attributes` und `limitations`. Das strenge API-Schema hat maximal 100 Objektattribute und maximal fünf Objektebenen; sämtliche Felder sind required, unsichere Einzelwerte nullable, alle Objekte geschlossen. Offline-Tests prüfen diese Grenzen. Fachliche Zusatzwerte werden als typisierte Attributliste statt offener Dictionaries übertragen; jeder Eintrag enthält owner_type, owner_id, name, value und source_ids. Die erlaubten Attributnamen stehen im Schema und in `common.md`.
+## Lokale Prüfung
 
-Dokumentattribute verwenden owner_id=`document`. Kontextdimensionen, Bedingungen und Antwortanweisungen gehören zur Frage; Pflichtangabe, Textlänge, Einheit, Grenzen, vorgefundene Werte und unveränderte Validierungsdefinitionen zum Feld. Mehrdeutige Datumsangaben werden als Originaltext gespeichert. Fehlende optionale Attribute bedeuten unbekannt, nie eine implizite globale Gültigkeit oder false-Pflichtangabe.
+Referenzen müssen existieren. Quellenzitate und Anmerkungen werden nach Normalisierung von Leerraum und Excel-Zeilenumbruch-Escapes verglichen. Höchstens zwei lange Wörter mit jeweils einem abweichenden Zeichen können als Schreibhinweis eingestuft werden; sie gelten dann ausdrücklich nicht als verifiziert. Zahlen, kurze Einheiten und ausgelassene Wörter fallen nicht unter diese Toleranz. Zielfelder werden gegen tatsächliche Zellen, komprimierte Leerbereiche, Merges und Datenvalidierungen geprüft.
 
-Alle lokalen Referenzen werden auf Existenz geprüft. Der Prüfer besitzt ein eigenes Schema mit `review_status`, `missing_items` (Originalzitat, Adresse, Kontext, Begründung) und `limitations`. Lücken müssen konkret belegt sein. `missing_found` ohne Lücke, `no_missing_found` mit Einschränkungen und unklare/abgeschnittene JSON-Ausgaben sind Fehler. Bei bereits erkannten Lücken gilt `missing_found`, auch wenn weitere Bereiche unklar bleiben.
+Dropdownwerte werden typisiert verglichen; leere Einträge entfallen auf beiden Seiten. Null und leere Strings sind leer, 0 und false bleiben echte Werte. Fehlende oder geänderte Werte sind Fehler, reine Reihenfolgeabweichungen Warnungen. Statische numerische Regeln sind prüfbar; dynamische Formeln werden nicht geraten. Formelziele und fehlende Quellen sind Fehler; Zellschutz, Merge-Unterzellen und möglicherweise gemeinsam verwendete Antwortfelder bleiben Hinweise für den Human Review. Semantische Feldzugehörigkeit und vollständige Fragenentdeckung kann Python nicht beweisen.
 
-Python erzeugt das umfangreichere finale `Result` mit verschachtelten Feldern und Optionen, technischen Schlüsseln und Prüfungen. Offene lokale Metadatenobjekte werden niemals als Wire-Schema gesendet. Ein fehlgeschlagener Lauf erhält einen Fehlerumschlag mit leerer Fragenliste, keine erfolgreiche Extraktion. Ungültige Referenzen bleiben im Kandidatendiagnoseartefakt nachvollziehbar und im Validierungsbericht sichtbar.
+Frageschlüssel beruhen auf Dokumentfamilie (relativer Eingabepfad), kanonischen Quellenadressen, belegtem Kontext, Produktpositionen und Unterfragenkennung. Modell-IDs und Listenreihenfolge sind keine Identitätsgrundlage. Feld- und Optionsschlüssel berücksichtigen Frage, Ziel, Rolle und exakte Werte. Kollisionen werden gemeldet, nicht still entfernt.
 
-## Identität und Dateibindung
+Jede lokale Prüfung hat `severity` (`info`, `warning`, `error`) zusätzlich zu ihrem Prüfergebnis. Die Statusregel `material_errors_only_v1` setzt nur bei `error` den Status `needs_review`. Unklare Kontexte, nicht verifizierbare Ziele, Schreibdetails und allgemeine Einschränkungen blockieren die Extraktion nicht. `completed` bedeutet ohne erkannten schwerwiegenden Fehler abgeschlossen, keine fachliche Freigabe. Technische/API-/Schemafehler sowie leere Extraktionen mit gemeldeten Einschränkungen ergeben weiterhin `failed`. Es gibt keine unabhängige semantische Modellprüfung.
 
-Standard-Dokumentfamilie ist der relative Pfad unter `sample_inputs/`, unabhängig vom Inhaltshash. Umbenennen der Datei ändert diese Familie. Frageschlüssel entstehen aus Familie, sortierten kanonischen Quelladressen, belegten Kontextdimensionen/-adressen, Produktpositionen und Unterfragenkennung. Lokale Modell-IDs, Lauf-ID, Listenposition und paraphrasierter Fragetext sind keine Identitätsgrundlage. Feldschlüssel berücksichtigen Frage, Zieladresse, Rolle und Feldquellen. Optionsschlüssel berücksichtigen Feld, exakten typisierten Exportwert und Quellen. Kollisionen werden gemeldet, keine Frage wird still gelöscht.
+## Artefakte und Limits
 
-A1-Adressen werden für Schlüssel von `$` bereinigt und großgeschrieben; ein einzelner Bereich A1:A1 wird zu A1. Merge-Unterzellen werden für die kanonische Identität zum Anker aufgelöst, während ein falscher behaupteter Merge-Anker im Prüfbericht weiterhin ein Fehler bleibt. Quellenzitate selbst bleiben unverändert. Mehrsprachige Parallelfassungen können mehrere Quellen derselben Frage bilden; gleiche Texte in anderen Kontexten erzeugen eigenständige Fragen.
+Pro Lauf werden nur `sol_questions.json` (vollständiger schemafähiger Kandidat) und `result.json` gespeichert. Bei abgeschnittener Antwort fehlt der Kandidat. Quellenkopie und Strukturmanifest sind temporär. Ein Kandidat ist keine fachliche Freigabe.
 
-Jeder Lauf arbeitet nach lokaler Vorprüfung mit einer bytegleichen Eingabekopie und protokolliert SHA-256. Das Original wird nicht gespeichert oder verändert. `original` und `rendered_pdf` werden über Dokumentmetadaten an konkrete Hashes gebunden. Das Word-PDF-Artefakt ist dieselbe Datei für alle Modellaufrufe und Document Intelligence.
-
-## Excel-Manifeste
-
-OOXML wird zeilenweise gestreamt; openpyxl stellt gemeinsame Zeichenketten, Formatvorlagen und Zahlenformate bereit. Keine rechteckige Iteration über max_row × max_column. Inhalte, Formeln samt OOXML-Attributen und vorhandene Caches werden je Zelladresse gespeichert. Fehlende Caches bleiben null. Numerische Originallexeme, Datentypen, Workbook-Datumsepoche und Stilreferenzen bleiben erhalten; Formeln, Makros und externe Verknüpfungen werden nicht ausgeführt.
-
-Physisch vorhandene leere Zellen werden je Spalte/Stil als aufeinanderfolgende Bereiche komprimiert. Zeilenattribute werden ebenfalls zu Läufen zusammengefasst. Spaltenattribute, verbundene Bereiche samt Ankern, Kommentare, Blattzustand, benannte Bereiche und Datenvalidierungen bleiben erhalten. Echte Inhalte werden nicht abgeschnitten. Das tatsächlich gefundene Excel hat millionenzeilige Formatierungsreste: Ihre Kompression ist notwendig und erfolgt ohne semantische Vorselektion.
-
-Inline-Listen, statische Bereichsreferenzen sowie eindeutig auflösbare lokale/globale benannte Bereiche werden aufgelöst, auch auf versteckten Blättern; lokale Namen haben Vorrang. Reihenfolge, Groß-/Kleinschreibung, Typ und Nullwerte bleiben erhalten. Dynamische/externe Ausdrücke, übergroße Optionsbereiche oder fehlende Formelcaches bleiben explizit unaufgelöst. Nicht unterstützte Steuerelemente, Zeichnungen und Erweiterungen erzeugen Einschränkungen; relevante XML-Teile bleiben als Rohdaten erhalten. Bildinhalt wird für Excel v1 nicht visuell ausgewertet.
-
-Ein Zielfeld muss in der beobachteten Struktur liegen. Die Prüfung betrachtet die vollständige Bereichsabdeckung durch belegte Zellen, Leerbereiche, Merges oder Datenvalidierungen. Eine bloß aufrufbare Exceladresse reicht nicht. Strukturbeleg bestätigt keine semantische Zuordnung. Excel-Dropdownbehauptungen werden gegen echte list-Regeln geprüft, Optionen exakt typisiert verglichen. Numerische/Längenregeln werden nur bei statisch vergleichbaren Grenzen bestätigt; komplexe Datums-/Formelausdrücke bleiben not_verifiable. Originalregel und Epoche bleiben im Manifest. Formeln und aktiv geschützte, gesperrte Zielzellen werden gesondert markiert; locked ohne aktiven Blattschutz ist kein Schreibverbot.
-
-## Word, PDF und OCR
-
-Word wird lokal konvertiert; sein zusätzlicher OOXML-Index enthält Dokumentteil und eindeutige Pfade einschließlich verschachtelter Tabellen, Absätze, Zellen und Inhaltssteuerelement-IDs. Ein direkt angegebener Originalpfad kann strukturell geprüft werden, beweist aber allein keine semantische Rückzuordnung aus dem PDF. Doppelte Texte und leere Zellen bleiben mehrdeutig. Ein Ziel ausschließlich im gerenderten PDF erhält `word_pdf_mapping=not_verifiable`; es wird keine Originaladresse erfunden.
-
-PDF-Seiten sind 1-basiert. Modell-bbox ist `[links, oben, rechts, unten]`, relativ zur linken oberen Ecke der **unrotierten MediaBox**, in PDF-Punkten. Manifest speichert Maße, MediaBox-Ursprung, Rotation und UserUnit. Native Formulare werden nach Name, technischem Typ und Optionswerten geprüft. Keine erfundenen Formularfelder für flache PDFs.
-
-Document Intelligence muss dieselben Seiten genau einmal abdecken. Native PDF-Texte und OCR-Zeilen werden mit Originalzitaten verglichen. Die einzige Textnormalisierung fasst Leerraum/Zeilenumbrüche zusammen. Unscharfe OCR-Treffer werden nicht zu exakten Treffern erklärt. Bei fehlendem exaktem Treffer bleibt die Behauptung unbestätigt; OCR und nativer Text stehen als beobachtete Fakten im Bericht.
-
-Bounding-Boxes werden auf die vereinbarten PDF-Seitengrenzen geprüft. OCR-Inch werden mit 72 multipliziert; bei Seitenrotation 90/180/270 Grad erfolgt die inverse Transformation in die unrotierte MediaBox. Vorher müssen OCR-Maße und gedrehte PDF-Maße innerhalb von zwei Punkten übereinstimmen. Pixelkoordinaten, ungewöhnliche UserUnit und abweichende Seitengrößen werden nicht geraten. Die Textneigung `angle` wird nicht irrtümlich nochmals als Seitenrotation angewendet. Ein Quellenzitat muss innerhalb des behaupteten Bereichs auch in den transformierten OCR-Zeilen enthalten sein (zwei Punkte Toleranz). Eine präzise beschreibbare Position wird weiterhin als not_verifiable ausgewiesen; Bereichs-/Textbestätigung ist keine semantische Schreibfreigabe. Das OCR-Rohergebnis bleibt erhalten.
-
-## Prüfstatus und Grenzen
-
-Jede Prüfung enthält subject, code, result (`passed`, `failed`, `not_verifiable`, `not_applicable`), beobachtete Tatsache, Modellbehauptung und Begründung. Quellenprüfungen werden den jeweils referenzierenden Fragen/Feldern zugeordnet. Der Gesamtbericht enthält zusätzlich dokumentweite Prüfungen und Referenzprobleme. Mehrfachbelegungen gleicher oder überlappender Excelziele werden angezeigt. Semantische Feldzugehörigkeit, menschliche Freigabe und tatsächlich vollständige Fragenentdeckung sind durch Python nicht beweisbar.
-
-V1 verarbeitet immer das ganze Dokument. Sie besitzt keine Chunkingstrategie, OCR-Reparaturschleife, Layoutprofile, Keyword-Fragenfilter, Konfidenz-basierte Modelleeskalation oder verdeckte Folgeaufrufe. Nach Sol wird die fehlende erneute Vollständigkeitsprüfung ausdrücklich ausgewiesen. Dokumentbeschränkungen, unbekannter Kontext und nicht prüfbare Ziele führen konservativ zu needs_review.
-
-Echte Qualitätsmessung braucht von Menschen geprüfte Soll-Fragen je Kontext. Die vorhandenen synthetischen Offline-Fixtures testen Technik und Regelverhalten; sie sind keine empirische Genauigkeitsmessung am realen Tender. Die reale Excelanalyse testet Strukturerhalt und Originalschutz, ohne fachliche Azureextraktion. Installation, Startbefehl und Cachekonfiguration stehen in der README.
+Das Ausgabelimit umfasst Reasoning und Antworttext; die Gesamttokenzahl enthält zusätzlich die Eingabe. Laufdaten speichern tatsächlich gesendetes Limit, Reasoning, Timeout, Nutzung, Status und Abbruchgrund. Die Projekt-`.env` wird bei jedem Start frisch gelesen und hat Vorrang vor geerbten Umgebungsvariablen. Fehlt ein Eintrag, gilt die Umgebungsvariable, danach der Standardwert. Ein Terminal-Neustart ist bei ?nderungen an `.env` nicht erforderlich. Defaults: 125000 Ausgabetokens, Reasoning `high`, Timeout 900 Sekunden. Es erfolgt kein automatischer weiterer Modellaufruf zur Reparatur oder Vervollständigung.

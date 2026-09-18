@@ -13,9 +13,10 @@ from .pipeline import run_file
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Genau eine Tenderdatei lokal verarbeiten (Azure-API-Aufrufe sind kostenpflichtig).")
-    parser.add_argument("--input",required=True,help="Konkrete .xlsx/.docx/.pdf innerhalb sample_inputs/")
+    parser.add_argument("--input",required=True,help="Konkrete .xlsx innerhalb sample_inputs/")
     parser.add_argument("--output-dir",default="outputs")
     args = parser.parse_args(argv)
+    print("[tender-extraction] CLI gestartet", flush=True)
     try:
         folder,run = run_file(args.input,args.output_dir,Config.from_env())
     except ExtractionError as e:
